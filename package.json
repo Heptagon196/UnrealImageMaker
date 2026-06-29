@@ -1,0 +1,42 @@
+{
+  "name": "unreal-image-maker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "set \"NO_PROXY=127.0.0.1,localhost\" && set \"no_proxy=127.0.0.1,localhost\" && vite --configLoader runner",
+    "build": "tsc && vite build --configLoader runner",
+    "preview": "vite preview --configLoader runner",
+    "preview:static": ".venv\\Scripts\\python.exe -m http.server 5173 -d dist",
+    "tauri": "set \"NO_PROXY=127.0.0.1,localhost\" && set \"no_proxy=127.0.0.1,localhost\" && set \"PATH=%USERPROFILE%\\.cargo\\bin;%CD%\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin;%PATH%\" && tauri",
+    "backend:test": "set PYTHONPATH=backend&& .venv\\Scripts\\python.exe -m unittest discover -s backend/tests -p \"test_*.py\"",
+    "backend:api": "set PYTHONPATH=backend&& .venv\\Scripts\\python.exe -m uim_core.api",
+    "mcp:pixel": "set PYTHONPATH=backend&& .venv\\Scripts\\python.exe -m uim_core.mcp_server"
+  },
+  "dependencies": {
+    "@radix-ui/react-alert-dialog": "^1.1.17",
+    "@radix-ui/react-context-menu": "^2.3.1",
+    "@tauri-apps/api": "^2.9.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-notification": "^2.3.3",
+    "@tauri-apps/plugin-opener": "^2.5.4",
+    "@vitejs/plugin-react": "^5.1.1",
+    "cmdk": "^1.1.1",
+    "lucide-react": "^0.562.0",
+    "react": "^19.2.1",
+    "react-arborist": "^3.10.5",
+    "react-dom": "^19.2.1",
+    "react-photo-view": "^1.2.7",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.5",
+    "@types/react": "^19.2.8",
+    "@types/react-dom": "^19.2.3",
+    "playwright": "^1.61.1"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
+  }
+}

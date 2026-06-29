@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Allow the main window to use core Tauri APIs, select project folders, open external OAuth URLs, and send completion notifications.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default", "opener:default", "notification:default"]
+}

@@ -1,0 +1,12 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pillow>=10.0
+requests>=2.31
+numpy>=2.0
+opencv-python-headless>=4.10
+scipy>=1.14
+imageio-ffmpeg>=0.5
+rembg[cpu]>=2.0
+unfake>=1.0.7
+mcp>=1.0
+playwright>=1.50
