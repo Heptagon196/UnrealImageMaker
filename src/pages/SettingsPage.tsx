@@ -26,6 +26,7 @@ export default function SettingsPage() {
     networkProxyDraft,
     openAiBaseUrlDraft,
     openAiKeyDraft,
+    openAiMergeEditImagesDraft,
     pixelMcpBackendPath,
     pixelMcpPythonPath,
     refreshCodexOAuth,
@@ -41,6 +42,7 @@ export default function SettingsPage() {
     setNetworkProxyDraft,
     setOpenAiBaseUrlDraft,
     setOpenAiKeyDraft,
+    setOpenAiMergeEditImagesDraft,
     setSeedanceEndpointDraft,
     setSeedanceKeyDraft,
     setSeedanceResolutionDraft,
@@ -55,7 +57,7 @@ export default function SettingsPage() {
       <div className="settings-grid">  
         <section className="detail-card">  
           <div className="section-kicker">运行设置</div>  
-          <label className="field">  
+          <label className="field checkbox-field">
             <span>OpenAI 密钥</span>  
             <input  
               type="password"  
@@ -73,7 +75,25 @@ export default function SettingsPage() {
             />  
           </label>  
           <label className="field">  
-            <span>Unreal MCP 地址</span>  
+            <input
+  
+              type="checkbox"
+  
+              checked={openAiMergeEditImagesDraft}
+  
+              onChange={(event) => setOpenAiMergeEditImagesDraft(event.target.checked)}
+  
+            />
+  
+            <span>合并 image 上传编辑</span>
+  
+            <small>默认开启：多参考图会先合成单张图片，并用单个 image 字段上传；关闭后使用 image[] 多文件上传。</small>
+  
+          </label>
+  
+          <label className="field">
+  
+            <span>Unreal MCP 地址</span>
             <input value={unrealMcpUrlDraft} onChange={(event) => setUnrealMcpUrlDraft(event.target.value)} placeholder="http://127.0.0.1:xxxx" />  
           </label>  
           <label className="field">  

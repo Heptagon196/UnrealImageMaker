@@ -147,6 +147,58 @@ def _decontaminate_edge_rgb(rgb, subject_mask, edge_pixels: int, cv2, np, ndimag
     return cleaned
 
 
+def _remove_chroma_key_spill_from_subject(rgb, bg_rgb, subject_mask, edge_pixels: int, cv2, np):
+    if edge_pixels <= 0 or not np.any(subject_mask):
+        return np.zeros_like(subject_mask, dtype=bool)
+    bg = bg_rgb.astype(np.int16)
+    magenta_key = bg[0] >= 180 and bg[2] >= 180 and bg[1] <= 96 and abs(int(bg[0]) - int(bg[2])) <= 96
+    if not magenta_key:
+        return np.zeros_like(subject_mask, dtype=bool)
+    r = rgb[:, :, 0].astype(np.int16)
+    g = rgb[:, :, 1].astype(np.int16)
+    b = rgb[:, :, 2].astype(np.int16)
+    dark_magenta_spill = (
+        (r >= 96)
+        & (b >= 96)
+        & (g <= 96)
+        & (g * 2 <= np.minimum(r, b))
+        & (np.abs(r - b) <= 128)
+    )
+    passable_from_background = (~subject_mask) | dark_magenta_spill
+    labels_count, labels = cv2.connectedComponents(passable_from_background.astype(np.uint8), connectivity=8)
+    edge_labels = set(int(value) for value in labels[0, passable_from_background[0, :]])
+    edge_labels.update(int(value) for value in labels[-1, passable_from_background[-1, :]])
+    edge_labels.update(int(value) for value in labels[passable_from_background[:, 0], 0])
+    edge_labels.update(int(value) for value in labels[passable_from_background[:, -1], -1])
+    edge_labels.discard(0)
+    removed = np.zeros_like(subject_mask, dtype=bool)
+    if labels_count > 1 and edge_labels:
+        connected_spill = subject_mask & dark_magenta_spill & np.isin(labels, list(edge_labels))
+        removed = removed | connected_spill
+        subject_mask = subject_mask & ~connected_spill
+    working_subject = subject_mask.copy()
+    for _iteration in range(4):
+        subject_edge = _edge_band(working_subject, max(4, edge_pixels * 3), cv2, np)
+        spill = working_subject & subject_edge & dark_magenta_spill
+        if not np.any(spill):
+            break
+        removed = removed | spill
+        working_subject = working_subject & ~spill
+    remaining_spill = subject_mask & ~removed & dark_magenta_spill
+    if np.any(remaining_spill):
+        labels_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(remaining_spill.astype(np.uint8), connectivity=8)
+        if labels_count > 1:
+            max_speckle_area = max(4, edge_pixels * edge_pixels * 8)
+            speckle_labels = [
+                label
+                for label in range(1, labels_count)
+                if stats[label, cv2.CC_STAT_AREA] <= max_speckle_area
+            ]
+            if speckle_labels:
+                removed = removed | np.isin(labels, speckle_labels)
+    return removed
+
+
 def _edge_band(subject_mask, edge_pixels: int, cv2, np):
     if edge_pixels <= 0 or not np.any(subject_mask):
         return np.zeros_like(subject_mask, dtype=bool)
@@ -207,6 +259,9 @@ def apply_pixel_mask(
         subject_mask = subject_mask & ~remove_fringe
     if np.any(background_leak):
         subject_mask = subject_mask & ~background_leak
+    chroma_spill = _remove_chroma_key_spill_from_subject(rgb, bg_rgb, subject_mask, edge_pixels, cv2, np)
+    if np.any(chroma_spill):
+        subject_mask = subject_mask & ~chroma_spill
     cleaned_rgb = rgb
     if decontaminate_edges:
         cleaned_rgb = _decontaminate_edge_rgb(rgb, subject_mask, edge_pixels, cv2, np, ndimage)
@@ -223,6 +278,7 @@ def apply_pixel_mask(
         Image.fromarray((edge_band.astype(np.uint8) * 255), "L").save(debug_dir / f"{debug_prefix}_edge_band.png")
         Image.fromarray((remove_fringe.astype(np.uint8) * 255), "L").save(debug_dir / f"{debug_prefix}_remove_fringe.png")
         Image.fromarray((background_leak.astype(np.uint8) * 255), "L").save(debug_dir / f"{debug_prefix}_background_leak.png")
+        Image.fromarray((chroma_spill.astype(np.uint8) * 255), "L").save(debug_dir / f"{debug_prefix}_chroma_spill.png")
         Image.fromarray((subject_mask.astype(np.uint8) * 255), "L").save(debug_dir / f"{debug_prefix}_subject_mask.png")
         if rembg_alpha_array is not None:
             Image.fromarray(rembg_alpha_array, "L").save(debug_dir / f"{debug_prefix}_rembg_alpha.png")
@@ -233,6 +289,7 @@ def apply_pixel_mask(
         "visiblePixels": int(subject_mask.sum()),
         "removedFringePixels": int(remove_fringe.sum()),
         "removedBackgroundLeakPixels": int(background_leak.sum()),
+        "removedChromaSpillPixels": int(chroma_spill.sum()),
         "decontaminated": bool(decontaminate_edges),
     }
 

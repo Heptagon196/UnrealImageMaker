@@ -244,8 +244,71 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(captured["url"], "https://compatible.example/v1/images/generations")
         self.assertEqual(captured["payload"]["response_format"], "b64_json")  # type: ignore[index]
-        self.assertIn("UnrealImageMaker/", str(captured["headers"].get("User-agent", "")))  # type: ignore[union-attr]
+        self.assertNotIn("stream", captured["payload"])  # type: ignore[operator]
+        self.assertEqual(captured["headers"].get("Accept"), "application/json")
+        self.assertEqual(captured["headers"].get("User-agent"), "codex_cli_rs/0.77.0 (Windows 10.0.26100; x86_64) WindowsTerminal")
         self.assertEqual(result.base_url, "https://compatible.example/v1")
+
+    def test_openai_provider_retries_retryable_generation_errors(self) -> None:
+        calls: list[int] = []
+
+        def fake_open_external_url(_request, timeout: int):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    "https://compatible.example/v1/images/generations",
+                    524,
+                    "Timeout",
+                    {},
+                    io.BytesIO(b'{"error_code":524,"retryable":true,"retry_after":120}'),
+                )
+            return _FakeOpenAIResponse()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "test-key", "OPENAI_BASE_URL": "https://compatible.example/v1", "UIM_OPENAI_IMAGE_RETRIES": "1"},
+            clear=False,
+        ), patch("uim_core.providers.openai_image.open_external_url", fake_open_external_url):
+            output = Path(tmp) / "image.png"
+            OpenAIImageProvider().generate("test", output)
+            self.assertEqual(output.read_bytes(), b"image")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_openai_provider_accepts_streamed_image_generation_result(self) -> None:
+        stream = "\n".join(
+            [
+                'data: {"type":"response.created"}',
+                "",
+                'data: {"type":"response.output_item.done","item":{"type":"image_generation_call","status":"completed","result":"aW1hZ2U="}}',
+                "",
+                'data: {"type":"response.completed","response":{"status":"completed","model":"gpt-image-2"}}',
+                "",
+            ]
+        ).encode("utf-8")
+
+        def fake_open_external_url(_request, timeout: int):
+            return _FakeOpenAIResponse(stream)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENAI_BASE_URL": "https://compatible.example/v1"}, clear=False), patch(
+            "uim_core.providers.openai_image.open_external_url", fake_open_external_url
+        ):
+            output = Path(tmp) / "image.png"
+            emitted: list[str] = []
+            with codex_stream_events(emitted.append):
+                result = OpenAIImageProvider().generate("test", output)
+            self.assertEqual(output.read_bytes(), b"image")
+
+        self.assertEqual(
+            result.stream_events,
+            [
+                "response.created",
+                "response.output_item.done item=image_generation_call status=completed",
+                "image_generation_call.result",
+                "response.completed status=completed model=gpt-image-2",
+            ],
+        )
+        self.assertEqual(emitted, result.stream_events)
 
     def test_openai_provider_reports_cloudflare_1010_hint(self) -> None:
         def fake_open_external_url(_request, timeout: int):

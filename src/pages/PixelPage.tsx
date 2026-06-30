@@ -12,7 +12,6 @@ export default function PixelPage() {
     PIXEL_RESTORE_MODE_OPTIONS,
     SEEDANCE_MODEL_OPTIONS,
     SlotPicker,
-    TILEMAP_STANDARD_OPTIONS,
     WorkerAlert,
     anchorConceptReferencePath,
     anchorOutputOptions,
@@ -93,6 +92,10 @@ export default function PixelPage() {
     pixelSubject,
     pixelTileSetPath,
     pixelTileSize,
+    pixelTilemapOuterMaterial,
+    pixelTilemapOuterPath,
+    pixelTilemapPrimaryMaterial,
+    pixelTilemapPrimaryPath,
     pixelTilemapSeedPath,
     pixelTilemapStandard,
     pixelTilemapSubject,
@@ -138,6 +141,10 @@ export default function PixelPage() {
     setPixelSubject,
     setPixelTileSetPath,
     setPixelTileSize,
+    setPixelTilemapOuterMaterial,
+    setPixelTilemapOuterPath,
+    setPixelTilemapPrimaryMaterial,
+    setPixelTilemapPrimaryPath,
     setPixelTilemapSeedPath,
     setPixelTilemapStandard,
     setPixelTilemapSubject,
@@ -161,7 +168,19 @@ export default function PixelPage() {
     const isTilemap = pixelKind === "tilemap";  
     const kindCopy = pixelKindCopy(pixelKind);  
     const activePixelStage = isTilemap ? (["tilemap_seed", "tilemap_tileset"].includes(pixelStage) ? pixelStage : "tilemap_seed") : pixelStage;
-    const seedanceAnchorCandidate = anchorPathForDirection(currentVideoDirection());  
+    const tileSizeOptions = [16, 32, 64, 128, 256];
+    const TileSizeSelect = ({ label = "单个 tile 边长", hint = "" }: { label?: string; hint?: string }) => (
+      <label className="field">
+        <span>{label}</span>
+        <select value={pixelTileSize} onChange={(event) => setPixelTileSize(Number(event.target.value))}>
+          {tileSizeOptions.map((size) => (
+            <option key={size} value={size}>{size}px</option>
+          ))}
+        </select>
+        {hint && <small>{hint}</small>}
+      </label>
+    );
+    const seedanceAnchorCandidate = anchorPathForDirection(currentVideoDirection());
     const seedanceDefaultModel = defaultSeedanceModel();  
     const seedanceDefaultResolution = defaultSeedanceResolution();  
     const activeSeedanceModel = currentSeedanceModel();  
@@ -183,8 +202,8 @@ export default function PixelPage() {
     }));  
     const pixelWorkflowSteps: Array<{ id: PixelStage; label: string; detail: string }> = isTilemap  
       ? [
-          { id: "tilemap_seed", label: "风格参考图", detail: "生成或导入地形风格参考" },
-          { id: "tilemap_tileset", label: `${tilemapStandardOption.shortLabel} Tile Set`, detail: `生成材质、精修边界并组装${tilemapStandardOption.label}` }
+          { id: "tilemap_seed", label: "材质样例", detail: "生成 outer / primary 格子" },
+          { id: "tilemap_tileset", label: "Dual-Grid 16", detail: "生成最终地形集" }
         ]
       : isCharacter  
         ? [  
@@ -339,38 +358,38 @@ export default function PixelPage() {
             <div className="section-header">
               <div>
                 <div className="section-kicker">阶段 1</div>
-                <strong>地形风格参考图</strong>
+                <strong>生成材质样例</strong>
               </div>
               <Wand2 size={18} />
             </div>
-            <p className="field-hint">先准备地形风格参考图：它只提供材质、调色、纹理密度和边缘语言；Tile Set 结构由第二步的程序 mask 和边界精修决定。</p>
+            <p className="field-hint">阶段一同步生成 outer / primary 两个纯材质样例格子。确认材质风格可用后，阶段二会读取这两个样例生成最终 Dual-Grid 16 地形集。</p>
             <label className="field">
-              <span>地形描述</span>
+              <span>整体风格备注</span>
               <textarea className="short-textarea" value={pixelTilemapSubject} onChange={(event) => setPixelTilemapSubject(event.target.value)} />
-              <small>生成风格参考图，也可以在第二步直接填入外部图片路径作为参考。</small>
+              <small>可选，用于统一调色、纹理密度和俯视角像素风格。</small>
             </label>
+            <div className="two-col">
+              <label className="field">
+                <span>Outer 材质描述</span>
+                <textarea className="short-textarea" value={pixelTilemapOuterMaterial} onChange={(event) => setPixelTilemapOuterMaterial(event.target.value)} />
+                <small>例如泥土、道路、水、沙地等外侧/背景地形。</small>
+              </label>
+              <label className="field">
+                <span>Primary 材质描述</span>
+                <textarea className="short-textarea" value={pixelTilemapPrimaryMaterial} onChange={(event) => setPixelTilemapPrimaryMaterial(event.target.value)} />
+                <small>例如草地、雪地、平台等内侧/主体地形。</small>
+              </label>
+            </div>
             <div className="three-col">
-              <label className="field">
-                <span>目标地形格式</span>
-                <select value={pixelTilemapStandard} onChange={(event) => setPixelTilemapStandard(event.target.value as TilemapStandard)}>
-                  {TILEMAP_STANDARD_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
-                  ))}
-                </select>
-                <small>{tilemapStandardOption.detail}</small>
-              </label>
-              <label className="field">
-                <span>逻辑图块尺寸</span>
-                <input type="number" value={pixelTileSize} onChange={(event) => setPixelTileSize(Number(event.target.value))} />
-              </label>
+              <TileSizeSelect hint="样例格子会归一化为 256px 工作 tile；最终地形集按这个逻辑 tile 边长输出。" />
               <label className="field span-2">
                 <span>UE 内容路径</span>
                 <input value={contentPath} onChange={(event) => setContentPath(event.target.value)} />
               </label>
             </div>
-            <button className="run-button" onClick={generateTilemapSeedConcept} disabled={disabled || !pixelTilemapSubject.trim()}>
+            <button className="run-button" onClick={generateTilemapSeedConcept} disabled={disabled || !pixelTilemapOuterMaterial.trim() || !pixelTilemapPrimaryMaterial.trim()}>
               <Wand2 size={17} />
-              生成地形风格参考图
+              生成材质样例
             </button>
           </section>
         );
@@ -382,34 +401,50 @@ export default function PixelPage() {
             <div className="section-header">
               <div>
                 <div className="section-kicker">阶段 2</div>
-                <strong>生成 {tilemapStandardOption.label} Tile Set</strong>
+                <strong>生成 Dual-Grid 16 地形集</strong>
               </div>
               <Layers size={18} />
             </div>
-            <p className="field-hint">使用阶段 1 的风格参考图生成材质对，程序硬拼 5x3，再让 AI 只精修边界；最终由程序组装 Tile Set。</p>
+            <p className="field-hint">读取阶段一的 outer / primary 样例格子，先程序化拼出 4x4 dual-grid 16 硬模板，再让 AI 只精修真实材质交界。</p>
             <div className="two-col">
               <label className="field">
-                <span>自动地形标准</span>
-                <select value={pixelTilemapStandard} onChange={(event) => setPixelTilemapStandard(event.target.value as TilemapStandard)}>
-                  {TILEMAP_STANDARD_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
-                  ))}
-                </select>
-                <small>{tilemapStandardOption.detail}</small>
+                <span>Outer 样例路径</span>
+                <input value={pixelTilemapOuterPath || pixelTilemapSeedPath} onChange={(event) => {
+                  setPixelTilemapOuterPath(event.target.value);
+                  setPixelTilemapSeedPath(event.target.value);
+                }} placeholder="阶段 1 生成的 outer 样例路径" />
               </label>
               <label className="field">
-                <span>逻辑图块尺寸</span>
-                <input type="number" value={pixelTileSize} onChange={(event) => setPixelTileSize(Number(event.target.value))} />
+                <span>Primary 样例路径</span>
+                <input value={pixelTilemapPrimaryPath} onChange={(event) => setPixelTilemapPrimaryPath(event.target.value)} placeholder="阶段 1 生成的 primary 样例路径" />
               </label>
             </div>
-            <label className="field">
-              <span>风格参考图路径</span>
-              <input value={pixelTilemapSeedPath} onChange={(event) => setPixelTilemapSeedPath(event.target.value)} placeholder="先在阶段 1 生成参考图，或填入项目内相对路径/绝对路径" />
-              <small>参考图只用于风格；程序 mask 锁定结构。</small>
-            </label>
-            <button className="run-button" onClick={composeTilemapFromSeed} disabled={disabled || !pixelTilemapSeedPath.trim()}>
+            {(pixelTilemapOuterPath || pixelTilemapSeedPath || pixelTilemapPrimaryPath) && (
+              <div className="sync-preview-grid">
+                {[
+                  { label: "Outer 样例格子", path: pixelTilemapOuterPath || pixelTilemapSeedPath },
+                  { label: "Primary 样例格子", path: pixelTilemapPrimaryPath }
+                ].map((sample) => (
+                  <div className="sync-preview-tile" key={sample.label}>
+                    <div className="sync-preview-title">
+                      <strong>{sample.label}</strong>
+                      <span>{sample.path ? "已选择" : "缺失"}</span>
+                    </div>
+                    <div className="sync-preview-frame">
+                      {sample.path ? (
+                        <img src={previewUrlForPath(projectRoot, sample.path)} alt={sample.label} />
+                      ) : (
+                        <span>暂无产物</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            <TileSizeSelect hint="必须和阶段一材质样例使用的逻辑 tile 边长一致。" />
+            <button className="run-button" onClick={composeTilemapFromSeed} disabled={disabled || !(pixelTilemapOuterPath || pixelTilemapSeedPath).trim() || !pixelTilemapPrimaryPath.trim()}>
               <Layers size={17} />
-              生成材质并组装{tilemapStandardOption.label} Tile Set
+              生成 Dual-Grid 16 地形集
             </button>
             <div className="advanced-toggle">
               <button type="button" onClick={() => setTilemapImportOpen((current) => !current)}>
@@ -422,10 +457,7 @@ export default function PixelPage() {
                   <span>地形集图片路径</span>
                   <input value={pixelTileSetPath} onChange={(event) => setPixelTileSetPath(event.target.value)} placeholder="项目内相对路径或绝对路径" />
                 </label>
-                <label className="field">
-                  <span>导入尺寸</span>
-                  <input type="number" value={pixelTileSize} onChange={(event) => setPixelTileSize(Number(event.target.value))} />
-                </label>
+                <TileSizeSelect label="导入尺寸" hint="单个 tile 边长，必须为 2 的幂次。" />
                 <button className="run-button span-3" onClick={createTilemapManifest} disabled={disabled || !pixelTileSetPath.trim()}>
                   <FileJson size={17} />
                   只生成{tilemapStandardOption.label}规则清单

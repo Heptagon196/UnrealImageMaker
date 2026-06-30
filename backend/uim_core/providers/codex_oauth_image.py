@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import base64
-from contextlib import contextmanager
-from contextvars import ContextVar
 import io
 import hashlib
 import json
@@ -13,12 +11,13 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 from ..json_io import read_json, write_json
 from ..network import configured_network_proxy, open_external_url
 from ..paths import user_data_dir
 from .openai_image import ImageGenerationResult
+from .stream_events import codex_stream_events, emit_stream_event
 
 OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OPENAI_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
@@ -28,26 +27,10 @@ OPENAI_OAUTH_SCOPE = "openid profile email offline_access"
 OPENAI_OAUTH_ACCOUNT_CLAIM_PATH = "https://api.openai.com/auth"
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_IMAGE_MODEL = "gpt-5.5"
-_stream_event_callback: ContextVar[Callable[[str], None] | None] = ContextVar("codex_stream_event_callback", default=None)
 
 
 def codex_oauth_store_path() -> Path:
     return user_data_dir() / "codex-oauth.json"
-
-
-@contextmanager
-def codex_stream_events(callback: Callable[[str], None] | None) -> Iterator[None]:
-    token = _stream_event_callback.set(callback)
-    try:
-        yield
-    finally:
-        _stream_event_callback.reset(token)
-
-
-def _emit_stream_event(summary: str) -> None:
-    callback = _stream_event_callback.get()
-    if callback and summary:
-        callback(summary)
 
 
 def create_pkce_flow(redirect_uri: str | None = None) -> dict[str, str]:
@@ -498,13 +481,13 @@ def read_codex_sse_response(response: Any) -> tuple[str, list[str]]:
         summary = summarize_sse_event(event)
         if summary:
             summaries.append(summary)
-            _emit_stream_event(summary)
+            emit_stream_event(summary)
         image = extract_image_result(event)
         if image:
             image_b64 = image
             if "image_generation_call.result" not in summaries:
                 summaries.append("image_generation_call.result")
-                _emit_stream_event("image_generation_call.result")
+                emit_stream_event("image_generation_call.result")
     if not image_b64:
         raise RuntimeError(f"Codex response did not include image_generation result. Events: {summaries[:24]}")
     return image_b64, summaries[:80]

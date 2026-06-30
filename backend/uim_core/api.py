@@ -91,7 +91,9 @@ from .specialized import (
     create_spritesheet_from_video,
     create_seedance_walk_video,
     create_tilemap_47_manifest,
+    create_tilemap_dual_grid_from_material_samples,
     create_tilemap_from_seed_manifest,
+    create_tilemap_material_samples,
     create_tilemap_seed_concept,
     create_tilemap_dual_grid_manifest,
     create_video_debug_export,
@@ -430,6 +432,7 @@ class ManifestRequest(BaseModel):
 class RuntimeSettingsRequest(BaseModel):
     openai_api_key: str | None = None
     openai_base_url: str | None = None
+    openai_merge_edit_images: bool | None = None
     unreal_mcp_url: str | None = None
     huggingface_token: str | None = None
     network_proxy: str | None = None
@@ -556,8 +559,9 @@ class Tilemap47Request(BaseModel):
 class TilemapSeedRequest(BaseModel):
     project_root: str
     asset_name: str
-    subject: str
-    standard: str = "47-tile"
+    subject: str = ""
+    outer_material: str = ""
+    primary_material: str = ""
     tile_size: int = Field(default=32, gt=0)
     style_id: str = "pixel_art"
     image_provider: str = "openai_api"
@@ -571,6 +575,21 @@ class TilemapComposeRequest(BaseModel):
     seed_path: str
     subject: str = ""
     standard: str = "47-tile"
+    tile_size: int = Field(default=32, gt=0)
+    style_id: str = "pixel_art"
+    image_provider: str = "openai_api"
+    content_path: str = "/Game/UIM/Tiles"
+    stream_session: str | None = None
+
+
+class TilemapDualGridGenerateRequest(BaseModel):
+    project_root: str
+    asset_name: str
+    outer_material_path: str
+    primary_material_path: str
+    subject: str = ""
+    outer_material: str = ""
+    primary_material: str = ""
     tile_size: int = Field(default=32, gt=0)
     style_id: str = "pixel_art"
     image_provider: str = "openai_api"
@@ -761,6 +780,8 @@ def _apply_saved_runtime_settings() -> None:
         os.environ["UIM_SEEDANCE_API_KEY"] = str(saved["seedanceApiKey"])
     if saved.get("openAiBaseUrl") and not os.environ.get("OPENAI_BASE_URL"):
         os.environ["OPENAI_BASE_URL"] = str(saved["openAiBaseUrl"])
+    if "openAiMergeEditImages" in saved and not os.environ.get("OPENAI_MERGE_EDIT_IMAGES"):
+        os.environ["OPENAI_MERGE_EDIT_IMAGES"] = "1" if bool(saved.get("openAiMergeEditImages")) else "0"
     if saved.get("unrealMcpUrl") and not os.environ.get("UIM_UNREAL_MCP_URL"):
         os.environ["UIM_UNREAL_MCP_URL"] = str(saved["unrealMcpUrl"])
     if saved.get("seedanceEndpoint") and not os.environ.get("UIM_SEEDANCE_ENDPOINT"):
@@ -792,6 +813,7 @@ def _runtime_settings() -> dict[str, Any]:
         "modelCacheDir": str(model_cache_dir()),
         "hasOpenAiApiKey": bool(os.environ.get("OPENAI_API_KEY")),
         "openAiBaseUrl": os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+        "openAiMergeEditImages": os.environ.get("OPENAI_MERGE_EDIT_IMAGES", "1").strip().lower() not in {"0", "false", "no", "off"},
         "unrealMcpUrl": os.environ.get("UIM_UNREAL_MCP_URL", ""),
         "hasHuggingFaceToken": bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")),
         "networkProxy": proxy,
@@ -870,6 +892,9 @@ def api_update_runtime_settings(request: RuntimeSettingsRequest) -> dict[str, An
         else:
             os.environ.pop("OPENAI_BASE_URL", None)
         _save_runtime_settings_patch({"openAiBaseUrl": value})
+    if request.openai_merge_edit_images is not None:
+        os.environ["OPENAI_MERGE_EDIT_IMAGES"] = "1" if request.openai_merge_edit_images else "0"
+        _save_runtime_settings_patch({"openAiMergeEditImages": request.openai_merge_edit_images})
     if request.unreal_mcp_url is not None:
         value = request.unreal_mcp_url.strip()
         if value:
@@ -1488,11 +1513,12 @@ def api_tilemap_seed(request: TilemapSeedRequest) -> dict[str, Any]:
     try:
         manifest = _run_with_stream_session(
             request.stream_session,
-            lambda: create_tilemap_seed_concept(
+            lambda: create_tilemap_material_samples(
                 project_root=Path(request.project_root),
                 asset_name=request.asset_name,
                 subject=request.subject,
-                standard=request.standard,
+                outer_material=request.outer_material,
+                primary_material=request.primary_material,
                 tile_size=request.tile_size,
                 style_id=request.style_id,
                 image_provider=request.image_provider,
@@ -1505,7 +1531,73 @@ def api_tilemap_seed(request: TilemapSeedRequest) -> dict[str, Any]:
             exc,
             project_root=request.project_root,
             asset_name=request.asset_name,
-            standard=request.standard,
+            outer_material=request.outer_material,
+            primary_material=request.primary_material,
+            image_provider=request.image_provider,
+            openai_base_url=os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+        )
+    return manifest.to_dict()
+
+
+@app.post("/specialized/pixel/tilemap-material-samples")
+def api_tilemap_material_samples(request: TilemapSeedRequest) -> dict[str, Any]:
+    try:
+        manifest = _run_with_stream_session(
+            request.stream_session,
+            lambda: create_tilemap_material_samples(
+                project_root=Path(request.project_root),
+                asset_name=request.asset_name,
+                subject=request.subject,
+                outer_material=request.outer_material,
+                primary_material=request.primary_material,
+                tile_size=request.tile_size,
+                style_id=request.style_id,
+                image_provider=request.image_provider,
+                content_path=request.content_path,
+            ),
+        )
+    except Exception as exc:
+        _raise_bad_request(
+            "specialized/pixel/tilemap-material-samples",
+            exc,
+            project_root=request.project_root,
+            asset_name=request.asset_name,
+            outer_material=request.outer_material,
+            primary_material=request.primary_material,
+            image_provider=request.image_provider,
+            openai_base_url=os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+        )
+    return manifest.to_dict()
+
+
+@app.post("/specialized/pixel/tilemap-dual-grid-generate")
+def api_tilemap_dual_grid_generate(request: TilemapDualGridGenerateRequest) -> dict[str, Any]:
+    root = Path(request.project_root)
+    try:
+        manifest = _run_with_stream_session(
+            request.stream_session,
+            lambda: create_tilemap_dual_grid_from_material_samples(
+                project_root=root,
+                asset_name=request.asset_name,
+                outer_material_path=_project_path(root, request.outer_material_path) or Path(request.outer_material_path),
+                primary_material_path=_project_path(root, request.primary_material_path) or Path(request.primary_material_path),
+                subject=request.subject,
+                outer_material=request.outer_material,
+                primary_material=request.primary_material,
+                tile_size=request.tile_size,
+                style_id=request.style_id,
+                image_provider=request.image_provider,
+                content_path=request.content_path,
+            ),
+        )
+    except Exception as exc:
+        _raise_bad_request(
+            "specialized/pixel/tilemap-dual-grid-generate",
+            exc,
+            project_root=request.project_root,
+            asset_name=request.asset_name,
+            outer_material_path=request.outer_material_path,
+            primary_material_path=request.primary_material_path,
             image_provider=request.image_provider,
             openai_base_url=os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
         )

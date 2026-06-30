@@ -185,18 +185,18 @@ const PIXEL_KIND_COPY: Record<
     label: "地形集",
     subjectLabel: "地形集设定",
     conceptTitle: "地形集",
-    conceptStepDetail: "生成或导入风格参考，再扩展 Tile Set",
-    conceptHint: "先准备地形风格参考图，再用第二步生成 47 图块或双网格 16 Tile Set。",
-    conceptButton: "生成地形风格参考",
-    anchorTitle: "生成 Tile Set",
-    anchorStepDetail: "从风格参考生成自动地形",
-    anchorHint: "读取风格参考图并生成自动地形 Tile Set。",
-    anchorButton: "生成 Tile Set",
-    anchorSlotLabel: "风格参考图",
-    anchorSlotDescription: "阶段 1 生成或外部导入的地形风格参考图。",
+    conceptStepDetail: "生成 outer / primary 材质样例",
+    conceptHint: "先同步生成 outer / primary 两个纯材质样例格子，确认材质可用后再生成最终 dual-grid 16 地形集。",
+    conceptButton: "生成材质样例",
+    anchorTitle: "生成 Dual-Grid 16",
+    anchorStepDetail: "从材质样例生成最终地形集",
+    anchorHint: "读取 outer / primary 两个样例格子，程序拼出 dual-grid 16 硬模板，再让 AI 精修真实过渡边界。",
+    anchorButton: "生成 Dual-Grid 16 地形集",
+    anchorSlotLabel: "材质样例",
+    anchorSlotDescription: "阶段 1 生成的 outer / primary 纯材质样例。",
     sheetTitle: "地形集",
     sheetStepDetail: "Tilemap 自动拼接规则",
-    sheetDirectHint: "地形集流程分为风格参考图和 Tile Set 生成两步。"
+    sheetDirectHint: "地形集流程分为材质样例和 Dual-Grid 16 生成两步。"
   }
 };
 
@@ -272,6 +272,7 @@ type RuntimeSettings = {
   modelCacheDir: string;
   hasOpenAiApiKey: boolean;
   openAiBaseUrl: string;
+  openAiMergeEditImages: boolean;
   unrealMcpUrl: string;
   hasHuggingFaceToken: boolean;
   networkProxy: string;
@@ -1030,8 +1031,8 @@ function EditableCommandCombobox({
 function App() {
   const [backend, setBackend] = useState<"checking" | "online" | "offline">("checking");
   const [workerStatus, setWorkerStatus] = useState<BackendWorkerStatus | null>(null);
-  const [projectRoot, setProjectRoot] = useState("C:/UnrealImageMaker/projects/Demo.uim");
-  const [projectName, setProjectName] = useState("Demo");
+  const [projectRoot, setProjectRoot] = useState("");
+  const [projectName, setProjectName] = useState("");
   const [projectPanelMode, setProjectPanelMode] = useState<"open" | "create">("open");
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(() => loadRecentProjects());
   const [project, setProject] = useState<ProjectOpenResult | null>(null);
@@ -1050,6 +1051,7 @@ function App() {
   const consoleOutputRef = useRef<HTMLDivElement | null>(null);
   const consolePinnedToBottomRef = useRef(true);
   const mcpUiRevisionRef = useRef(0);
+  const projectRootRef = useRef("");
   const videoFramePickerRef = useRef<HTMLVideoElement | null>(null);
   const videoSelectionPreviewTimerRef = useRef<number | null>(null);
   const videoSelectionPreviewingRef = useRef(false);
@@ -1059,6 +1061,8 @@ function App() {
   const videoFrameThumbnailCacheRef = useRef(new Map<string, string>());
   const videoFrameMetricCacheRef = useRef(new Map<string, VideoFrameMetrics>());
   const videoLoopScoreCacheRef = useRef(new Map<string, VideoLoopScore>());
+  const assetRefreshRequestRef = useRef(0);
+  const workspaceRefreshRequestRef = useRef(0);
   const [gameUiPreviewCanvasWidth, setGameUiPreviewCanvasWidth] = useState(0);
   const [previewHeight, setPreviewHeight] = useState(360);
   const previewResizeRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null);
@@ -1074,6 +1078,7 @@ function App() {
   const [networkCheck, setNetworkCheck] = useState<NetworkCheckResult | null>(null);
   const [openAiKeyDraft, setOpenAiKeyDraft] = useState("");
   const [openAiBaseUrlDraft, setOpenAiBaseUrlDraft] = useState("");
+  const [openAiMergeEditImagesDraft, setOpenAiMergeEditImagesDraft] = useState(true);
   const [huggingFaceTokenDraft, setHuggingFaceTokenDraft] = useState("");
   const [unrealMcpUrlDraft, setUnrealMcpUrlDraft] = useState("");
   const [networkProxyDraft, setNetworkProxyDraft] = useState("");
@@ -1134,8 +1139,12 @@ function App() {
   const [pixelAnchorOutputSize, setPixelAnchorOutputSize] = useState("1024x1024");
   const [pixelTileSetPath, setPixelTileSetPath] = useState("");
   const [pixelTilemapSeedPath, setPixelTilemapSeedPath] = useState("");
+  const [pixelTilemapOuterPath, setPixelTilemapOuterPath] = useState("");
+  const [pixelTilemapPrimaryPath, setPixelTilemapPrimaryPath] = useState("");
   const [pixelTilemapSubject, setPixelTilemapSubject] = useState("青草地形过渡到泥土地面，清晰边缘与角落过渡，适合俯视角像素 RPG 地图");
-  const [pixelTilemapStandard, setPixelTilemapStandard] = useState<TilemapStandard>("47-tile");
+  const [pixelTilemapOuterMaterial, setPixelTilemapOuterMaterial] = useState("紧实泥土地面，少量碎石与干燥颗粒，俯视角无草叶");
+  const [pixelTilemapPrimaryMaterial, setPixelTilemapPrimaryMaterial] = useState("茂密青草地面，短草簇和自然绿色纹理，俯视角像素 RPG 风格");
+  const [pixelTilemapStandard, setPixelTilemapStandard] = useState<TilemapStandard>("dual-grid-16");
   const [pixelTileSize, setPixelTileSize] = useState(32);
   const [tilemapImportOpen, setTilemapImportOpen] = useState(false);
   const [pixelSeedanceSeconds, setPixelSeedanceSeconds] = useState(5);
@@ -1520,15 +1529,31 @@ function App() {
   }
 
   async function refreshProjectAssets(root = projectRoot) {
-    const result = await api<ProjectAssetsResponse>(`/projects/assets?${new URLSearchParams({ project_root: root }).toString()}`);
-    setAssets(result.assets);
+    const normalizedRoot = normalizeProjectRootInput(root);
+    const requestId = ++assetRefreshRequestRef.current;
+    if (!normalizedRoot) {
+      setAssets([]);
+      return [];
+    }
+    const result = await api<ProjectAssetsResponse>(`/projects/assets?${new URLSearchParams({ project_root: normalizedRoot }).toString()}`);
+    if (requestId === assetRefreshRequestRef.current && normalizeProjectRootInput(projectRootRef.current) === normalizedRoot) {
+      setAssets(result.assets);
+    }
     return result.assets;
   }
 
   async function refreshProjectWorkspace(root = projectRoot) {
-    const result = await api<ProjectWorkspaceResponse>(`/projects/workspace?${new URLSearchParams({ project_root: root }).toString()}`);
-    setWorkflowSlots(result.workflowSlots && typeof result.workflowSlots === "object" ? result.workflowSlots : {});
-    applyMcpUiState(result.mcpUiState);
+    const normalizedRoot = normalizeProjectRootInput(root);
+    const requestId = ++workspaceRefreshRequestRef.current;
+    if (!normalizedRoot) {
+      setWorkflowSlots({});
+      return;
+    }
+    const result = await api<ProjectWorkspaceResponse>(`/projects/workspace?${new URLSearchParams({ project_root: normalizedRoot }).toString()}`);
+    if (requestId === workspaceRefreshRequestRef.current && normalizeProjectRootInput(projectRootRef.current) === normalizedRoot) {
+      setWorkflowSlots(result.workflowSlots && typeof result.workflowSlots === "object" ? result.workflowSlots : {});
+      applyMcpUiState(result.mcpUiState);
+    }
   }
 
   function pixelSettingsFromAsset(asset: AssetRecord | null): PixelAssetSettings {
@@ -1601,8 +1626,11 @@ function App() {
     if (state.pixelDirection) setPixelDirection(state.pixelDirection);
     if (state.pixelSheetMode && ["direct", "video"].includes(state.pixelSheetMode)) setPixelSheetMode(state.pixelSheetMode);
     if (state.lastMessage) pushLog(`MCP：${state.lastMessage}`);
-    refreshProjectAssets(projectRoot).catch((error) => pushLog(error.message));
-    refreshGameUiWorkspace().catch((error) => pushLog(error.message));
+    const activeRoot = normalizeProjectRootInput(projectRootRef.current || projectRoot);
+    if (activeRoot) {
+      refreshProjectAssets(activeRoot).catch((error) => pushLog(error.message));
+      refreshGameUiWorkspace().catch((error) => pushLog(error.message));
+    }
   }
 
   async function saveWorkflowSlots(nextSlots: WorkflowSlots) {
@@ -2117,11 +2145,18 @@ function App() {
       title: `${tilemapStandardOption.label}地形集`,
       inputVersions: [],
       outputVersions: versionsByMatchers([
+        roleMatcherExact("source:tilemap:wang-5x3"),
         roleMatcherExact("seed:tilemap-3x3"),
+        roleMatcherExact("source:tilemap:outer-material"),
+        roleMatcherExact("source:tilemap:primary-material"),
+        roleMatcherExact("guide:tilemap:outer-material-grid"),
+        roleMatcherExact("guide:tilemap:primary-material-grid"),
         roleMatcherExact("source:tilemap:materials"),
         roleMatcherExact("source:tilemap:wang-5x3-hard"),
+        roleMatcherExact("guide:tilemap:wang-5x3-grid"),
+        roleMatcherExact("guide:tilemap:wang-5x3-edit-reference"),
+        roleMatcherExact("source:tilemap:wang-5x3-work"),
         roleMatcherExact("mask:tilemap:wang-5x3-boundary"),
-        roleMatcherExact("source:tilemap:wang-5x3"),
         roleMatcherExact(currentTilemapRole()),
         roleMatcherExact(currentTilemapPreviewRole())
       ])
@@ -2288,6 +2323,7 @@ function App() {
     const result = await api<RuntimeSettings>("/settings/runtime");
     setRuntimeSettings(result);
     setOpenAiBaseUrlDraft(result.openAiBaseUrl || "https://api.openai.com/v1");
+    setOpenAiMergeEditImagesDraft(result.openAiMergeEditImages !== false);
     setUnrealMcpUrlDraft(result.unrealMcpUrl);
     setNetworkProxyDraft(result.networkProxy || "");
     setSeedanceEndpointDraft(result.seedanceEndpoint || DEFAULT_SEEDANCE_ENDPOINT);
@@ -2306,6 +2342,7 @@ function App() {
           body: JSON.stringify({
             openai_api_key: openAiKeyDraft || null,
             openai_base_url: openAiBaseUrlDraft,
+            openai_merge_edit_images: openAiMergeEditImagesDraft,
             unreal_mcp_url: unrealMcpUrlDraft,
             huggingface_token: huggingFaceTokenDraft || null,
             network_proxy: networkProxyDraft,
@@ -2427,7 +2464,12 @@ function App() {
   function disconnectProject() {
     if (!project) return;
     const closedName = project.project.name || projectNameFromRoot(projectRoot);
+    assetRefreshRequestRef.current += 1;
+    workspaceRefreshRequestRef.current += 1;
+    projectRootRef.current = "";
     setProject(null);
+    setProjectRoot("");
+    setProjectName("");
     setAssets([]);
     setWorkflowSlots({});
     setCurrentManifest(null);
@@ -2508,11 +2550,21 @@ function App() {
       const name = projectName.trim() || projectNameFromRoot(root);
       if (!root) throw new Error("请填写项目目录。");
       if (!name) throw new Error("请填写项目名。");
+      assetRefreshRequestRef.current += 1;
+      workspaceRefreshRequestRef.current += 1;
+      projectRootRef.current = "";
+      setProject(null);
+      setProjectRoot(root);
+      setProjectName(name);
+      setAssets([]);
+      setWorkflowSlots({});
+      setCurrentManifest(null);
       const result = await api<ProjectOpenResult["project"]>("/projects", {
         method: "POST",
         body: JSON.stringify({ root, name, overwrite: true })
       });
       setProject({ project: result, lockedModels: [], missingModels: [] });
+      projectRootRef.current = root;
       setProjectRoot(root);
       setProjectName(result.name || name);
       rememberRecentProject(root, result.name || name);
@@ -2527,11 +2579,21 @@ function App() {
     await runAction("打开项目", async () => {
       await ensureBackendOnlineForProjectAction();
       if (!root) throw new Error("请填写项目目录。");
+      assetRefreshRequestRef.current += 1;
+      workspaceRefreshRequestRef.current += 1;
+      projectRootRef.current = "";
+      setProject(null);
+      setProjectRoot(root);
+      setProjectName(nameHint || projectNameFromRoot(root));
+      setAssets([]);
+      setWorkflowSlots({});
+      setCurrentManifest(null);
       const result = await api<ProjectOpenResult>("/projects/open", {
         method: "POST",
         body: JSON.stringify({ root })
       });
       setProject(result);
+      projectRootRef.current = root;
       setProjectRoot(root);
       setProjectName(result.project.name || nameHint || projectNameFromRoot(root));
       rememberRecentProject(root, result.project.name || nameHint || projectNameFromRoot(root));
@@ -2914,12 +2976,19 @@ function App() {
       return `动作视频：${action || "动作"}${direction ? ` / ${pixelDirectionLabel(direction)}` : ""}`;
     }
     if (role.startsWith("runtime:")) return `运行时序列图：${role.slice("runtime:".length)}`;
-    if (role === "seed:tilemap-3x3") return "地形风格参考图";
+    if (role === "seed:tilemap-3x3") return "旧地形风格参考图";
     if (role === "guide:tilemap:wang-5x3") return "5x3 Wang 约束图";
+    if (role === "source:tilemap:outer-material") return "Outer 高分辨率材质";
+    if (role === "source:tilemap:primary-material") return "Primary 高分辨率材质";
+    if (role === "guide:tilemap:outer-material-grid") return "Outer 材质网格基准图";
+    if (role === "guide:tilemap:primary-material-grid") return "Primary 材质网格基准图";
     if (role === "source:tilemap:materials") return "地形材质对";
-    if (role === "source:tilemap:wang-5x3-hard") return "程序硬拼 5x3";
+    if (role === "source:tilemap:wang-5x3-hard") return "程序硬拼工作图";
+    if (role === "guide:tilemap:wang-5x3-grid") return "WangTiles 网格基准图";
+    if (role === "guide:tilemap:wang-5x3-edit-reference") return "WangTiles 上传前合并图";
+    if (role === "source:tilemap:wang-5x3-work") return "边缘精修工作图";
     if (role === "mask:tilemap:wang-5x3-boundary") return "边界精修蒙版";
-    if (role === "source:tilemap:wang-5x3") return "边界精修 5x3 源图";
+    if (role === "source:tilemap:wang-5x3") return "3行x5列 WangTiles图";
     if (role === "preview:tilemap:47-tile") return "47 图块测试拼图";
     if (role === "preview:tilemap:dual-grid-16") return "双网格测试拼图";
     if (role.startsWith("preview:")) return `预览图：${role.slice("preview:".length)}`;
@@ -4237,49 +4306,16 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
 
   async function generateTilemapSeedConcept() {
     await runAction(
-      "生成地形风格参考图",
+      "生成材质样例",
       (streamSession) =>
-        api<Record<string, unknown>>("/specialized/pixel/tilemap-seed", {
+        api<Record<string, unknown>>("/specialized/pixel/tilemap-material-samples", {
           method: "POST",
           body: JSON.stringify({
             project_root: projectRoot,
             asset_name: assetName,
             subject: pixelTilemapSubject,
-            standard: pixelTilemapStandard,
-            tile_size: pixelTileSize,
-            style_id: "pixel_art",
-            image_provider: imageProvider,
-            content_path: `${contentPath}/Tiles`,
-            stream_session: streamSession
-          })
-        }),
-      async (manifest) => {
-        const record = await handleSpecializedManifest(manifest);
-        const outputPath = firstManifestPath(manifest) || "";
-        if (outputPath) {
-          setPixelTilemapSeedPath(outputPath);
-          const version = record?.versions?.find((item) => item.path === outputPath);
-          setActivePreviewVersionId(version?.id ?? null);
-          setActivePreviewPath(outputPath);
-          setActivePreviewLabel(`${record?.name || assetName} / ${version ? versionDisplayLabel(version) : "地形风格参考图"}`);
-          setPixelStage("tilemap_tileset");
-        }
-      }
-    );
-  }
-
-  async function composeTilemapFromSeed() {
-    await runAction(
-      `生成材质、精修边界并组装 ${tilemapStandardOption.label}Tile Set`,
-      (streamSession) =>
-        api<Record<string, unknown>>("/specialized/pixel/tilemap-compose", {
-          method: "POST",
-          body: JSON.stringify({
-            project_root: projectRoot,
-            asset_name: assetName,
-            seed_path: pixelTilemapSeedPath,
-            subject: pixelTilemapSubject,
-            standard: pixelTilemapStandard,
+            outer_material: pixelTilemapOuterMaterial,
+            primary_material: pixelTilemapPrimaryMaterial,
             tile_size: pixelTileSize,
             style_id: "pixel_art",
             image_provider: imageProvider,
@@ -4290,14 +4326,55 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
       async (manifest) => {
         const record = await handleSpecializedManifest(manifest);
         const files = Array.isArray(manifest.files) ? manifest.files as Array<{ role?: string; path?: string }> : [];
-        const previewFile = files.find((file) => file.role === currentTilemapPreviewRole());
-        const tilesetFile = files.find((file) => file.role === currentTilemapRole());
+        const outerFile = files.find((file) => file.role === "source:tilemap:outer-material");
+        const primaryFile = files.find((file) => file.role === "source:tilemap:primary-material");
+        const outputPath = outerFile?.path || primaryFile?.path || firstManifestPath(manifest) || "";
+        if (outerFile?.path) setPixelTilemapOuterPath(outerFile.path);
+        if (primaryFile?.path) setPixelTilemapPrimaryPath(primaryFile.path);
+        if (outputPath) {
+          setPixelTilemapSeedPath(outputPath);
+          const version = record?.versions?.find((item) => item.path === outputPath);
+          setActivePreviewVersionId(version?.id ?? null);
+          setActivePreviewPath(outputPath);
+          setActivePreviewLabel(`${record?.name || assetName} / ${version ? versionDisplayLabel(version) : "材质样例"}`);
+          setPixelStage("tilemap_tileset");
+        }
+      }
+    );
+  }
+
+  async function composeTilemapFromSeed() {
+    await runAction(
+      "生成 Dual-Grid 16 地形集",
+      (streamSession) =>
+        api<Record<string, unknown>>("/specialized/pixel/tilemap-dual-grid-generate", {
+          method: "POST",
+          body: JSON.stringify({
+            project_root: projectRoot,
+            asset_name: assetName,
+            outer_material_path: pixelTilemapOuterPath || pixelTilemapSeedPath,
+            primary_material_path: pixelTilemapPrimaryPath,
+            subject: pixelTilemapSubject,
+            tile_size: pixelTileSize,
+            outer_material: pixelTilemapOuterMaterial,
+            primary_material: pixelTilemapPrimaryMaterial,
+            style_id: "pixel_art",
+            image_provider: imageProvider,
+            content_path: `${contentPath}/Tiles`,
+            stream_session: streamSession
+          })
+        }),
+      async (manifest) => {
+        const record = await handleSpecializedManifest(manifest);
+        const files = Array.isArray(manifest.files) ? manifest.files as Array<{ role?: string; path?: string }> : [];
+        const previewFile = files.find((file) => file.role === "preview:tilemap:dual-grid-16");
+        const tilesetFile = files.find((file) => file.role === "tileset:dual-grid-16");
         const outputPath = previewFile?.path || tilesetFile?.path || firstManifestPath(manifest) || "";
         if (outputPath) {
           const version = record?.versions?.find((item) => item.path === outputPath);
           setActivePreviewVersionId(version?.id ?? null);
           setActivePreviewPath(outputPath);
-          setActivePreviewLabel(`${record?.name || assetName} / ${version ? versionDisplayLabel(version) : tilemapStandardOption.label}`);
+          setActivePreviewLabel(`${record?.name || assetName} / ${version ? versionDisplayLabel(version) : "Dual-Grid 16"}`);
         }
       }
     );
@@ -4868,24 +4945,22 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
         refreshModels().catch((error) => pushLog(error.message));
         refreshRuntimeSettings().catch((error) => pushLog(error.message));
         checkUnrealStatus().catch((error) => pushLog(error.message));
-        refreshProjectAssets().catch((error) => pushLog(error.message));
-        refreshProjectWorkspace().catch((error) => pushLog(error.message));
-        refreshGameUiWorkspace().catch((error) => pushLog(error.message));
       }
     });
   }, []);
 
   useEffect(() => {
-    if (backend !== "online") return;
+    if (backend !== "online" || !project || !projectRoot) return;
     const timer = window.setInterval(() => {
       refreshProjectWorkspace(projectRoot).catch(() => undefined);
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [backend, projectRoot]);
+  }, [backend, projectRoot, project?.project.id]);
 
   useEffect(() => {
+    if (backend !== "online" || !project || !projectRoot) return;
     refreshGameUiWorkspace().catch(() => undefined);
-  }, [backend, projectRoot]);
+  }, [backend, projectRoot, project?.project.id]);
 
   useEffect(() => {
     if (!selectedAsset) return;
@@ -5685,6 +5760,7 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     normalizeSourceSlot,
     openAiBaseUrlDraft,
     openAiKeyDraft,
+    openAiMergeEditImagesDraft,
     openGameUiSkinPreview,
     openVideoFramePicker,
     pixelAction,
@@ -5732,6 +5808,10 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     pixelSubject,
     pixelTileSetPath,
     pixelTileSize,
+    pixelTilemapOuterMaterial,
+    pixelTilemapOuterPath,
+    pixelTilemapPrimaryMaterial,
+    pixelTilemapPrimaryPath,
     pixelTilemapSeedPath,
     pixelTilemapStandard,
     pixelTilemapSubject,
@@ -5783,6 +5863,7 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     setNetworkProxyDraft,
     setOpenAiBaseUrlDraft,
     setOpenAiKeyDraft,
+    setOpenAiMergeEditImagesDraft,
     setPixelActionDescription,
     setPixelActionFromId,
     setPixelActionMenuOpen,
@@ -5812,6 +5893,10 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     setPixelSubject,
     setPixelTileSetPath,
     setPixelTileSize,
+    setPixelTilemapOuterMaterial,
+    setPixelTilemapOuterPath,
+    setPixelTilemapPrimaryMaterial,
+    setPixelTilemapPrimaryPath,
     setPixelTilemapSeedPath,
     setPixelTilemapStandard,
     setPixelTilemapSubject,
