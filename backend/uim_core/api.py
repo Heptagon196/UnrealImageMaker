@@ -91,6 +91,8 @@ from .specialized import (
     create_spritesheet_from_video,
     create_seedance_walk_video,
     create_tilemap_47_manifest,
+    create_tilemap_from_seed_manifest,
+    create_tilemap_seed_concept,
     create_tilemap_dual_grid_manifest,
     create_video_debug_export,
     extract_video_frame_thumbnails,
@@ -549,6 +551,31 @@ class Tilemap47Request(BaseModel):
     tile_size: int = Field(default=32, gt=0)
     style_id: str = "pixel_art"
     content_path: str = "/Game/UIM/Tiles"
+
+
+class TilemapSeedRequest(BaseModel):
+    project_root: str
+    asset_name: str
+    subject: str
+    standard: str = "47-tile"
+    tile_size: int = Field(default=32, gt=0)
+    style_id: str = "pixel_art"
+    image_provider: str = "openai_api"
+    content_path: str = "/Game/UIM/Tiles"
+    stream_session: str | None = None
+
+
+class TilemapComposeRequest(BaseModel):
+    project_root: str
+    asset_name: str
+    seed_path: str
+    subject: str = ""
+    standard: str = "47-tile"
+    tile_size: int = Field(default=32, gt=0)
+    style_id: str = "pixel_art"
+    image_provider: str = "openai_api"
+    content_path: str = "/Game/UIM/Tiles"
+    stream_session: str | None = None
 
 
 class SeedanceWalkRequest(BaseModel):
@@ -1453,6 +1480,67 @@ def api_pixel_cutout(request: PixelCutoutRequest) -> dict[str, Any]:
         )
     except Exception as exc:
         _raise_bad_request("specialized/pixel/cutout", exc, project_root=request.project_root, asset_name=request.asset_name, action=request.action, direction=request.direction, sheet_path=request.sheet_path)
+    return manifest.to_dict()
+
+
+@app.post("/specialized/pixel/tilemap-seed")
+def api_tilemap_seed(request: TilemapSeedRequest) -> dict[str, Any]:
+    try:
+        manifest = _run_with_stream_session(
+            request.stream_session,
+            lambda: create_tilemap_seed_concept(
+                project_root=Path(request.project_root),
+                asset_name=request.asset_name,
+                subject=request.subject,
+                standard=request.standard,
+                tile_size=request.tile_size,
+                style_id=request.style_id,
+                image_provider=request.image_provider,
+                content_path=request.content_path,
+            ),
+        )
+    except Exception as exc:
+        _raise_bad_request(
+            "specialized/pixel/tilemap-seed",
+            exc,
+            project_root=request.project_root,
+            asset_name=request.asset_name,
+            standard=request.standard,
+            image_provider=request.image_provider,
+            openai_base_url=os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+        )
+    return manifest.to_dict()
+
+
+@app.post("/specialized/pixel/tilemap-compose")
+def api_tilemap_compose(request: TilemapComposeRequest) -> dict[str, Any]:
+    root = Path(request.project_root)
+    try:
+        manifest = _run_with_stream_session(
+            request.stream_session,
+            lambda: create_tilemap_from_seed_manifest(
+                project_root=root,
+                asset_name=request.asset_name,
+                seed_path=_project_path(root, request.seed_path) or Path(request.seed_path),
+                subject=request.subject,
+                standard=request.standard,
+                tile_size=request.tile_size,
+                style_id=request.style_id,
+                image_provider=request.image_provider,
+                content_path=request.content_path,
+            ),
+        )
+    except Exception as exc:
+        _raise_bad_request(
+            "specialized/pixel/tilemap-compose",
+            exc,
+            project_root=request.project_root,
+            asset_name=request.asset_name,
+            standard=request.standard,
+            seed_path=request.seed_path,
+            image_provider=request.image_provider,
+            openai_base_url=os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+        )
     return manifest.to_dict()
 
 

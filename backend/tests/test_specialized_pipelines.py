@@ -16,11 +16,24 @@ from uim_core.asset_index import load_asset_index
 from uim_core.manifest import validate_manifest
 from uim_core.pixel_postprocess import apply_pixel_mask, run_unfake_restore
 from uim_core.project import create_project
-from uim_core.providers.openai_image import ImageGenerationResult
+from uim_core.providers.openai_image import ImageGenerationResult, OpenAIImageProvider
 from uim_core.providers.seedance_provider import DEFAULT_SEEDANCE_ENDPOINT, SeedanceProvider, SeedanceResult
 from uim_core.specialized import (
     TILEMAP_47_IDS,
     TILEMAP_DUAL_GRID_16_IDS,
+    _cleanup_tilemap_wang_source,
+    _cleanup_boundary_refined_wang_source,
+    _compose_wang_47_tile,
+    _compose_wang_dual_grid_tile,
+    _create_hard_wang_source_from_material_pair,
+    _create_tilemap_boundary_mask,
+    _is_primary_quadrant_source_pixel,
+    _tilemap_boundary_refine_prompt,
+    _tilemap_material_pair_prompt,
+    _tilemap_seed_prompt,
+    _tilemap_wang_source_prompt,
+    _terrain_mask,
+    _wang_source_quadrants_for_cell,
     create_animation_sheet,
     import_animation_sheet,
     create_pixel_anchor,
@@ -29,6 +42,8 @@ from uim_core.specialized import (
     create_spritesheet_cutout,
     create_spritesheet_from_video,
     create_tilemap_47_manifest,
+    create_tilemap_from_seed_manifest,
+    create_tilemap_seed_concept,
     create_tilemap_dual_grid_manifest,
     create_video_debug_export,
     create_ui_concept,
@@ -50,6 +65,34 @@ def _fake_image(output_path: Path, size: tuple[int, int] = (64, 64)) -> None:
     image.save(output_path)
 
 
+def _mock_wang_source(tile_size: int = 32):
+    from PIL import Image
+
+    colors = {
+        (0, 0): (201, 32, 32, 255),
+        (1, 0): (220, 132, 36, 255),
+        (2, 0): (221, 211, 46, 255),
+        (0, 1): (53, 176, 59, 255),
+        (1, 1): (42, 132, 220, 255),
+        (2, 1): (125, 78, 210, 255),
+        (0, 2): (226, 85, 176, 255),
+        (1, 2): (64, 205, 207, 255),
+        (2, 2): (105, 68, 37, 255),
+        (3, 0): (245, 105, 83, 255),
+        (4, 0): (84, 224, 126, 255),
+        (3, 1): (91, 116, 240, 255),
+        (4, 1): (234, 209, 71, 255),
+        (3, 2): (245, 245, 245, 255),
+        (4, 2): (12, 12, 12, 255),
+    }
+    source = Image.new("RGBA", (5 * tile_size, 3 * tile_size), (0, 0, 0, 0))
+    for row in range(3):
+        for col in range(5):
+            tile = Image.new("RGBA", (tile_size, tile_size), colors[(col, row)])
+            source.paste(tile, (col * tile_size, row * tile_size))
+    return source
+
+
 class _FakeSeedanceHttpResponse:
     def __init__(self, body: bytes, headers: dict[str, str] | None = None) -> None:
         self._body = body
@@ -63,6 +106,24 @@ class _FakeSeedanceHttpResponse:
 
     def read(self) -> bytes:
         return self._body
+
+
+class _FakeOpenAIEditResponse:
+    status_code = 200
+    text = "{}"
+    headers = {"x-request-id": "req-edit"}
+
+    def json(self) -> dict[str, object]:
+        return {
+            "data": [
+                {
+                    "b64_json": (
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEA"
+                        "gh6FOQAAAABJRU5ErkJggg=="
+                    )
+                }
+            ]
+        }
 
 
 def _fake_generate(_provider, prompt: str, output_path: Path, *, size: str = "1024x1024", quality: str = "auto", model: str = "gpt-image-2") -> ImageGenerationResult:
@@ -1197,6 +1258,314 @@ class SpecializedPipelineTests(unittest.TestCase):
             create_project(root, "Demo")
             with self.assertRaises(ValueError):
                 create_tilemap_47_manifest(root, "Grass Terrain", root / "missing.png", 32, "pixel_art", "/Game/UIM/Tiles")
+
+    def test_openai_edit_many_posts_array_images_before_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hard_source = root / "hard.png"
+            style_seed = root / "seed.png"
+            material_pair = root / "materials.png"
+            boundary_mask = root / "mask.png"
+            output = root / "output.png"
+            for path in (hard_source, style_seed, material_pair, boundary_mask):
+                _fake_image(path)
+            captured: dict[str, object] = {}
+
+            def fake_post(url: str, *, headers: dict[str, str], data: dict[str, str], files: list[tuple[str, tuple[str, object, str]]], proxies: object, timeout: int) -> _FakeOpenAIEditResponse:
+                captured["url"] = url
+                captured["fields"] = [field for field, _payload in files]
+                captured["filenames"] = [payload[0] for _field, payload in files]
+                captured["data"] = data
+                captured["timeout"] = timeout
+                return _FakeOpenAIEditResponse()
+
+            with patch("requests.post", fake_post):
+                result = OpenAIImageProvider(api_key="key", base_url="https://example.test").edit_many(
+                    "refine boundary",
+                    [hard_source, style_seed, material_pair],
+                    output,
+                    size="1600x960",
+                    mask_path=boundary_mask,
+                )
+
+            self.assertEqual(captured["url"], "https://example.test/images/edits")
+            self.assertEqual(captured["fields"], ["image[]", "image[]", "image[]", "mask"])
+            self.assertEqual(captured["filenames"], ["hard.png", "seed.png", "materials.png", "mask.png"])
+            self.assertEqual(captured["data"]["size"], "1600x960")
+            self.assertEqual(result.request_id, "req-edit")
+            self.assertTrue(output.exists())
+
+    def test_tilemap_seed_and_compose_are_separate_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Demo.uim"
+            create_project(root, "Demo")
+            with patch("uim_core.providers.openai_image.OpenAIImageProvider.generate", _fake_generate):
+                seed_manifest = create_tilemap_seed_concept(root, "Grass Terrain", "grass into dirt", "47-tile", 32, "pixel_art", "openai_api", "/Game/UIM/Tiles")
+
+            self.assertEqual(seed_manifest.asset_type, "texture")
+            self.assertEqual(seed_manifest.files[0].role, "seed:tilemap-3x3")
+            calls: list[dict[str, object]] = []
+
+            def fake_generate_image(
+                prompt: str,
+                output_path: Path,
+                image_provider: str,
+                *,
+                size: str = "1024x1024",
+                reference_path: Path | None = None,
+                reference_paths: list[Path] | None = None,
+                mask_path: Path | None = None,
+            ) -> ImageGenerationResult:
+                calls.append(
+                    {
+                        "prompt": prompt,
+                        "image_provider": image_provider,
+                        "reference_path": reference_path,
+                        "reference_paths": reference_paths,
+                        "mask_path": mask_path,
+                        "size": size,
+                    }
+                )
+                if "materials" in output_path.name:
+                    from PIL import Image
+
+                    image = Image.new("RGBA", (1536, 768), (180, 130, 72, 255))
+                    image.paste(Image.new("RGBA", (768, 768), (42, 150, 54, 255)), (768, 0))
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    image.save(output_path)
+                else:
+                    _fake_image(output_path, (1600, 960))
+                return ImageGenerationResult(output_path=output_path, model="fake-model", prompt=prompt, size=size, quality="auto", stream_events=[f"fake {len(calls)} event"])
+
+            with patch("uim_core.specialized._generate_image", fake_generate_image):
+                composed = create_tilemap_from_seed_manifest(root, "Grass Terrain", root / seed_manifest.files[0].path, "grass into dirt", "dual-grid-16", 32, "pixel_art", "openai_api", "/Game/UIM/Tiles")
+            roles = {file.role for file in composed.files}
+            self.assertIn("tileset:dual-grid-16", roles)
+            self.assertIn("source:tilemap:materials", roles)
+            self.assertIn("source:tilemap:wang-5x3-hard", roles)
+            self.assertIn("mask:tilemap:wang-5x3-boundary", roles)
+            self.assertIn("source:tilemap:wang-5x3", roles)
+            self.assertIn("preview:tilemap:dual-grid-16", roles)
+            self.assertNotIn("tileset:47", roles)
+            seed_file = next(file for file in composed.files if file.role == "seed:tilemap-3x3")
+            material_file = next(file for file in composed.files if file.role == "source:tilemap:materials")
+            hard_file = next(file for file in composed.files if file.role == "source:tilemap:wang-5x3-hard")
+            mask_file = next(file for file in composed.files if file.role == "mask:tilemap:wang-5x3-boundary")
+            source_file = next(file for file in composed.files if file.role == "source:tilemap:wang-5x3")
+            self.assertEqual(composed.processing["tilemap"]["source"], "ai-materials-programmatic-wang-refined")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0]["image_provider"], "openai_api")
+            self.assertEqual(calls[0]["size"], "1536x768")
+            self.assertEqual(calls[0]["reference_path"], root / seed_file.path)
+            self.assertIsNone(calls[0]["mask_path"])
+            self.assertIn("2-cell horizontal", str(calls[0]["prompt"]))
+            self.assertIn("no 5x3 Wang source", str(calls[0]["prompt"]))
+            self.assertEqual(calls[1]["size"], "1600x960")
+            self.assertIsNone(calls[1]["reference_path"])
+            self.assertEqual(calls[1]["reference_paths"], [root / hard_file.path, root / seed_file.path, root / material_file.path])
+            self.assertEqual(calls[1]["mask_path"], root / mask_file.path)
+            self.assertIn("Refine the boundary band", str(calls[1]["prompt"]))
+            self.assertIn("geometry is mandatory", str(calls[1]["prompt"]))
+            self.assertIn("materialPairPath", composed.processing["tilemap"])
+            self.assertIn("hardWangSourcePath", composed.processing["tilemap"])
+            self.assertIn("boundaryMaskPath", composed.processing["tilemap"])
+            self.assertIn("aiRefinedWangSourcePath", composed.processing["tilemap"])
+            self.assertIn("wangSourcePath", composed.processing["tilemap"])
+            self.assertEqual(composed.processing["tilemap"]["materialPairPath"], material_file.path)
+            self.assertEqual(composed.processing["tilemap"]["hardWangSourcePath"], hard_file.path)
+            self.assertEqual(composed.processing["tilemap"]["boundaryMaskPath"], mask_file.path)
+            self.assertEqual(composed.processing["tilemap"]["wangSourcePath"], source_file.path)
+            self.assertEqual(composed.processing["tilemap"]["sourceCleanup"], "boundary-refine-mask-guided-wang")
+            self.assertEqual(composed.processing["tilemap"]["referencePurpose"], "style-only")
+            self.assertEqual(composed.processing["tilemap"]["assembly"], "wang-5x3-half-quarter")
+            self.assertEqual(composed.processing["tilemap"]["layout"]["columns"], 4)
+            self.assertEqual(composed.processing["tilemap"]["streamEvents"], ["fake 1 event", "fake 2 event"])
+
+    def test_tilemap_wang_source_cleanup_forces_mask_geometry(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tile_size = 32
+            source_path = Path(tmp) / "bad_source.png"
+            output_path = Path(tmp) / "cleaned_source.png"
+            source = Image.new("RGBA", (5 * tile_size, 3 * tile_size), (255, 0, 255, 255))
+            source.paste(Image.new("RGBA", (tile_size, tile_size), (245, 245, 245, 255)), (3 * tile_size, 2 * tile_size))
+            source.paste(Image.new("RGBA", (tile_size, tile_size), (12, 12, 12, 255)), (4 * tile_size, 2 * tile_size))
+            source.save(source_path)
+
+            _cleanup_tilemap_wang_source(source_path, output_path, tile_size)
+
+            with Image.open(output_path) as cleaned_image:
+                cleaned = cleaned_image.convert("RGBA")
+                self.assertEqual(cleaned.getpixel((1, 1)), (245, 245, 245, 255))
+                self.assertEqual(cleaned.getpixel((tile_size - 2, tile_size - 2)), (12, 12, 12, 255))
+                self.assertNotEqual(cleaned.getpixel((1, 1)), (255, 0, 255, 255))
+
+    def test_tilemap_material_prompt_asks_only_for_full_materials(self) -> None:
+        prompt = _tilemap_material_pair_prompt("grass into dirt", "47-tile", 32)
+
+        self.assertIn("2-cell horizontal", prompt)
+        self.assertIn("left cell: full outer terrain", prompt)
+        self.assertIn("right cell: full primary terrain", prompt)
+        self.assertIn("no 5x3 Wang source", prompt)
+        self.assertNotIn("draw exactly 47", prompt)
+
+    def test_tilemap_boundary_refine_prompt_locks_geometry(self) -> None:
+        prompt = _tilemap_boundary_refine_prompt("grass into dirt", "dual-grid-16", 32)
+
+        self.assertIn("Refine the boundary band", prompt)
+        self.assertIn("geometry is mandatory", prompt)
+        self.assertIn("do not move the transition line", prompt)
+        self.assertIn("full dirt and full grass interiors must remain unchanged", prompt)
+
+    def test_tilemap_hard_wang_source_uses_exact_material_masks(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tile_size = 32
+            material_pair = Path(tmp) / "materials.png"
+            hard_source = Path(tmp) / "hard.png"
+            outer = (180, 130, 72, 255)
+            primary = (42, 150, 54, 255)
+            image = Image.new("RGBA", (2 * tile_size, tile_size), outer)
+            image.paste(Image.new("RGBA", (tile_size, tile_size), primary), (tile_size, 0))
+            image.save(material_pair)
+
+            _create_hard_wang_source_from_material_pair(material_pair, hard_source, tile_size)
+
+            with Image.open(hard_source) as source_image:
+                source = source_image.convert("RGBA")
+                self.assertEqual(source.size, (5 * tile_size, 3 * tile_size))
+                self.assertEqual(source.getpixel((1, 1)), outer)
+                self.assertEqual(source.getpixel((tile_size - 2, tile_size - 2)), primary)
+                self.assertEqual(source.getpixel((4 * tile_size + 8, 2 * tile_size + 8)), primary)
+                self.assertEqual(source.getpixel((3 * tile_size + 8, 2 * tile_size + 8)), outer)
+
+    def test_tilemap_boundary_mask_only_opens_transition_band(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tile_size = 32
+            mask_path = Path(tmp) / "mask.png"
+
+            _create_tilemap_boundary_mask(mask_path, tile_size)
+
+            with Image.open(mask_path) as mask_image:
+                mask = mask_image.convert("RGBA")
+                self.assertEqual(mask.size, (5 * tile_size, 3 * tile_size))
+                self.assertEqual(mask.getpixel((4 * tile_size + 8, 2 * tile_size + 8))[3], 255)
+                self.assertEqual(mask.getpixel((3 * tile_size + 8, 2 * tile_size + 8))[3], 255)
+                self.assertEqual(mask.getpixel((tile_size // 2, 12))[3], 0)
+                self.assertEqual(mask.getpixel((4, 4))[3], 255)
+
+    def test_tilemap_boundary_cleanup_restores_locked_pixels(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tile_size = 32
+            hard_path = Path(tmp) / "hard.png"
+            refined_path = Path(tmp) / "refined.png"
+            mask_path = Path(tmp) / "mask.png"
+            output_path = Path(tmp) / "output.png"
+            hard = Image.new("RGBA", (5 * tile_size, 3 * tile_size), (10, 20, 30, 255))
+            refined = Image.new("RGBA", hard.size, (250, 20, 200, 255))
+            hard.save(hard_path)
+            refined.save(refined_path)
+            _create_tilemap_boundary_mask(mask_path, tile_size)
+
+            _cleanup_boundary_refined_wang_source(refined_path, hard_path, mask_path, output_path, tile_size)
+
+            with Image.open(output_path) as output_image:
+                output = output_image.convert("RGBA")
+                self.assertEqual(output.getpixel((4, 4)), (10, 20, 30, 255))
+                self.assertEqual(output.getpixel((tile_size // 2, 12)), (250, 20, 200, 255))
+
+    def test_tilemap_wang_47_mask_zero_keeps_center_island(self) -> None:
+        from PIL import Image
+
+        tile_size = 32
+        primary = (12, 12, 12, 255)
+        outer = (245, 245, 245, 255)
+        source = Image.new("RGBA", (5 * tile_size, 3 * tile_size), outer)
+        for row in range(3):
+            for col in range(5):
+                quadrants = _wang_source_quadrants_for_cell(col, row)
+                tile_x = col * tile_size
+                tile_y = row * tile_size
+                for y in range(tile_size):
+                    for x in range(tile_size):
+                        if _is_primary_quadrant_source_pixel(quadrants, x, y, tile_size):
+                            source.putpixel((tile_x + x, tile_y + y), primary)
+
+        tile = _compose_wang_47_tile(source, tile_size, 0)
+
+        for point in [(0, 0), (tile_size - 1, 0), (0, tile_size - 1), (tile_size - 1, tile_size - 1)]:
+            self.assertEqual(tile.getpixel(point), outer)
+        for point in [(20, 20), (11, 20), (20, 11)]:
+            self.assertEqual(tile.getpixel(point), primary)
+
+    def test_tilemap_wang_47_uses_expected_quarter_sources(self) -> None:
+        tile_size = 32
+        source = _mock_wang_source(tile_size)
+
+        full = _compose_wang_47_tile(source, tile_size, _terrain_mask(n=True, e=True, s=True, w=True, ne=True, se=True, sw=True, nw=True))
+        self.assertEqual(full.getpixel((4, 4)), source.getpixel((4 * tile_size + 4, 2 * tile_size + 4)))
+
+        north = _compose_wang_47_tile(source, tile_size, _terrain_mask(n=True, e=False, s=False, w=False))
+        self.assertEqual(north.getpixel((4, 4)), source.getpixel((3 * tile_size + 4, 2 * tile_size + 4)))
+
+        outer = _compose_wang_47_tile(source, tile_size, 0)
+        self.assertEqual(outer.getpixel((4, 4)), source.getpixel((3 * tile_size + 4, 2 * tile_size + 4)))
+        self.assertEqual(outer.getpixel((20, 20)), source.getpixel((4 * tile_size + 20, 2 * tile_size + 20)))
+
+        inner = _compose_wang_47_tile(source, tile_size, _terrain_mask(n=True, e=True, s=True, w=True, ne=False, se=True, sw=True, nw=True))
+        self.assertEqual(inner.getpixel((tile_size - 4, 4)), source.getpixel((4 * tile_size + tile_size - 4, 4)))
+        self.assertEqual(inner.getpixel((4, 4)), source.getpixel((4 * tile_size + 4, 2 * tile_size + 4)))
+
+    def test_tilemap_wang_dual_grid_uses_transition_quarters(self) -> None:
+        tile_size = 32
+        source = _mock_wang_source(tile_size)
+
+        empty = _compose_wang_dual_grid_tile(source, tile_size, 0)
+        self.assertEqual(empty.getpixel((4, 4)), source.getpixel((3 * tile_size + 4, 2 * tile_size + 4)))
+
+        single_nw = _compose_wang_dual_grid_tile(source, tile_size, 1)
+        self.assertEqual(single_nw.getpixel((4, 4)), source.getpixel((4 * tile_size + 4, 2 * tile_size + 4)))
+        self.assertEqual(single_nw.getpixel((tile_size - 4, tile_size - 4)), source.getpixel((3 * tile_size + tile_size - 4, 2 * tile_size + tile_size - 4)))
+
+        top = _compose_wang_dual_grid_tile(source, tile_size, 3)
+        self.assertEqual(top.getpixel((4, 4)), source.getpixel((4 * tile_size + 4, 2 * tile_size + 4)))
+        self.assertEqual(top.getpixel((tile_size - 4, 4)), source.getpixel((4 * tile_size + tile_size - 4, 2 * tile_size + 4)))
+
+        left = _compose_wang_dual_grid_tile(source, tile_size, 5)
+        self.assertEqual(left.getpixel((4, 4)), source.getpixel((4 * tile_size + 4, 2 * tile_size + 4)))
+        self.assertEqual(left.getpixel((4, tile_size - 4)), source.getpixel((4 * tile_size + 4, 2 * tile_size + tile_size - 4)))
+
+        diagonal = _compose_wang_dual_grid_tile(source, tile_size, 9)
+        self.assertEqual(diagonal.getpixel((4, 4)), source.getpixel((4 * tile_size + 4, 2 * tile_size + 4)))
+        self.assertEqual(diagonal.getpixel((tile_size - 4, tile_size - 4)), source.getpixel((4 * tile_size + tile_size - 4, 2 * tile_size + tile_size - 4)))
+
+        three = _compose_wang_dual_grid_tile(source, tile_size, 7)
+        self.assertEqual(three.getpixel((tile_size - 4, tile_size - 4)), source.getpixel((3 * tile_size + tile_size - 4, 2 * tile_size + tile_size - 4)))
+
+        full = _compose_wang_dual_grid_tile(source, tile_size, 15)
+        self.assertEqual(full.getpixel((4, 4)), source.getpixel((4 * tile_size + 4, 2 * tile_size + 4)))
+
+    def test_tilemap_seed_prompt_describes_style_reference_only(self) -> None:
+        prompt = _tilemap_seed_prompt("grass into dirt", "47-tile", 32)
+
+        self.assertIn("style reference only", prompt)
+        self.assertIn("not a structural tileset guide", prompt)
+        self.assertIn("do not attempt to solve the final 47-tile or dual-grid structure", prompt)
+        self.assertNotIn("Fixed 3x3 semantics", prompt)
+
+    def test_tilemap_wang_source_prompt_uses_style_reference_and_structural_guide(self) -> None:
+        prompt = _tilemap_wang_source_prompt("grass into dirt", "dual-grid-16", 32)
+
+        self.assertIn("style reference only", prompt)
+        self.assertIn("do not copy its layout or geometry", prompt)
+        self.assertIn("Wang guide controls structure", prompt)
+        self.assertIn("final full tileset will be assembled programmatically", prompt)
 
     def test_ui_concept_and_widget_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

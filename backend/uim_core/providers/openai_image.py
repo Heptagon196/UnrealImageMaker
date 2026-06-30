@@ -97,8 +97,9 @@ class OpenAIImageProvider:
         model: str = "gpt-image-2",
         size: str = "1024x1024",
         quality: str = "auto",
+        mask_path: Path | None = None,
     ) -> ImageGenerationResult:
-        return self.edit_many(prompt, [image_path], output_path, model=model, size=size, quality=quality)
+        return self.edit_many(prompt, [image_path], output_path, model=model, size=size, quality=quality, mask_path=mask_path)
 
     def edit_many(
         self,
@@ -109,6 +110,7 @@ class OpenAIImageProvider:
         model: str = "gpt-image-2",
         size: str = "1024x1024",
         quality: str = "auto",
+        mask_path: Path | None = None,
     ) -> ImageGenerationResult:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -121,12 +123,16 @@ class OpenAIImageProvider:
         for image_path in image_paths:
             if not image_path.exists() or not image_path.is_file():
                 raise ValueError(f"Reference image does not exist: {image_path}")
+        if mask_path is not None and (not mask_path.exists() or not mask_path.is_file()):
+            raise ValueError(f"Edit mask image does not exist: {mask_path}")
 
         with ExitStack() as stack:
             files = [
-                ("image", (image_path.name, stack.enter_context(image_path.open("rb")), _image_mime_type(image_path)))
+                ("image[]", (image_path.name, stack.enter_context(image_path.open("rb")), _image_mime_type(image_path)))
                 for image_path in image_paths
             ]
+            if mask_path is not None:
+                files.append(("mask", (mask_path.name, stack.enter_context(mask_path.open("rb")), _image_mime_type(mask_path))))
             response = requests.post(
                 f"{self.base_url}/images/edits",
                 headers=_api_headers(self.api_key, include_content_type=False),

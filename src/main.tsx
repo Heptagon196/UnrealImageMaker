@@ -1,9 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Command } from "cmdk";
-import { PhotoProvider, PhotoView } from "react-photo-view";
-import { Tree, type NodeRendererProps } from "react-arborist";
-import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
@@ -13,33 +10,25 @@ import {
   CheckCircle2,
   Check,
   ChevronDown,
-  ClipboardCopy,
   Cpu,
-  Database,
-  Download,
-  Eraser,
-  Eye,
-  ExternalLink,
   FileImage,
-  Folder,
-  FolderPlus,
-  FileJson,
-  FolderOpen,
-  History,
   Layers,
-  Play,
   RefreshCw,
-  Scissors,
-  Settings,
-  SkipBack,
-  SkipForward,
-  Sparkles,
-  Trash2,
-  Wand2,
-  X
+  Settings
 } from "lucide-react";
-import "react-photo-view/dist/react-photo-view.css";
 import "./styles.css";
+import { AppContext } from "./AppContext";
+
+const PixelPage = lazy(() => import("./pages/PixelPage"));
+const GameUiPage = lazy(() => import("./pages/GameUiPage"));
+const ModelsPage = lazy(() => import("./pages/ModelsPage"));
+const SettingsPage = lazy(() => import("./pages/SettingsPage"));
+const AssetsPage = lazy(() => import("./pages/AssetsPage"));
+const ExportPage = lazy(() => import("./pages/ExportPage"));
+const ProjectSidebar = lazy(() => import("./components/ProjectSidebar"));
+const RightPanel = lazy(() => import("./components/RightPanel"));
+const AssetPreviewPanel = lazy(() => import("./components/AssetPreviewPanel"));
+const AppDialogs = lazy(() => import("./dialogs/AppDialogs"));
 
 const API_BASE = "http://127.0.0.1:8765";
 const EXPECTED_API_CONTRACT_VERSION = "uim-api-2026-06-29-ui-import-assets";
@@ -196,18 +185,18 @@ const PIXEL_KIND_COPY: Record<
     label: "地形集",
     subjectLabel: "地形集设定",
     conceptTitle: "地形集",
-    conceptStepDetail: "导入地形集图片并生成自动地形规则清单",
-    conceptHint: "导入已有地形集图片，生成 47 图块或双网格自动地形规则清单；本阶段不生成图片。",
-    conceptButton: "生成地形规则清单",
-    anchorTitle: "地形集导入",
-    anchorStepDetail: "自动地形规则清单",
-    anchorHint: "导入已有地形集图片并生成规则清单。",
-    anchorButton: "生成地形规则清单",
-    anchorSlotLabel: "地形集图片",
-    anchorSlotDescription: "导入已有地形集图片。",
+    conceptStepDetail: "生成或导入风格参考，再扩展 Tile Set",
+    conceptHint: "先准备地形风格参考图，再用第二步生成 47 图块或双网格 16 Tile Set。",
+    conceptButton: "生成地形风格参考",
+    anchorTitle: "生成 Tile Set",
+    anchorStepDetail: "从风格参考生成自动地形",
+    anchorHint: "读取风格参考图并生成自动地形 Tile Set。",
+    anchorButton: "生成 Tile Set",
+    anchorSlotLabel: "风格参考图",
+    anchorSlotDescription: "阶段 1 生成或外部导入的地形风格参考图。",
     sheetTitle: "地形集",
-    sheetStepDetail: "规则清单",
-    sheetDirectHint: "地形集当前支持导入并生成自动地形规则清单。"
+    sheetStepDetail: "Tilemap 自动拼接规则",
+    sheetDirectHint: "地形集流程分为风格参考图和 Tile Set 生成两步。"
   }
 };
 
@@ -215,7 +204,7 @@ function pixelKindCopy(kind: PixelKind) {
   return PIXEL_KIND_COPY[kind];
 }
 
-type PixelStage = "concept" | "south_anchor" | "neutral_anchor" | "direction_anchor" | "sheet" | "cutout" | "normalize" | "tilemap";
+type PixelStage = "concept" | "south_anchor" | "neutral_anchor" | "direction_anchor" | "sheet" | "cutout" | "normalize" | "tilemap_seed" | "tilemap_tileset";
 type PixelSheetMode = "direct" | "video";
 type PixelMaskMode = "hybrid" | "rembg" | "classic";
 type PixelRestoreMode = "none" | "clean" | "safe" | "pixel";
@@ -243,15 +232,15 @@ const TILEMAP_STANDARD_OPTIONS: Array<{ value: TilemapStandard; label: string; s
     value: "47-tile",
     label: "47 图块",
     shortLabel: "47",
-    description: "传统 47-tile 自动地形，tileset 按 8 列 row-major 排布。",
-    detail: "适合已有 47map 地形集；保持当前导出兼容。"
+    description: "AI 生成泥土/青草材质并精修边界，再程序组装为传统 47-tile 混合集。",
+    detail: "适合自然地形边缘；tileset 按 8 列 row-major 排布。"
   },
   {
     value: "dual-grid-16",
     label: "双网格 16",
     shortLabel: "双网格",
-    description: "Dual-grid autotiling，4x4 row-major，mask_00 到 mask_15。",
-    detail: "mask 位定义：NW=1, NE=2, SW=4, SE=8。"
+    description: "AI 生成泥土/青草材质并精修边界，再程序组装为 dual-grid 转角集。",
+    detail: "4x4 row-major；mask 位定义：NW=1, NE=2, SW=4, SE=8。"
   }
 ];
 
@@ -1144,8 +1133,11 @@ function App() {
   const [pixelCellSize, setPixelCellSize] = useState(256);
   const [pixelAnchorOutputSize, setPixelAnchorOutputSize] = useState("1024x1024");
   const [pixelTileSetPath, setPixelTileSetPath] = useState("");
+  const [pixelTilemapSeedPath, setPixelTilemapSeedPath] = useState("");
+  const [pixelTilemapSubject, setPixelTilemapSubject] = useState("青草地形过渡到泥土地面，清晰边缘与角落过渡，适合俯视角像素 RPG 地图");
   const [pixelTilemapStandard, setPixelTilemapStandard] = useState<TilemapStandard>("47-tile");
   const [pixelTileSize, setPixelTileSize] = useState(32);
+  const [tilemapImportOpen, setTilemapImportOpen] = useState(false);
   const [pixelSeedanceSeconds, setPixelSeedanceSeconds] = useState(5);
   const [pixelMatrixSelection, setPixelMatrixSelection] = useState<string[]>([]);
   const [pixelBatchQueue, setPixelBatchQueue] = useState<PixelBatchTask[]>([]);
@@ -1450,7 +1442,7 @@ function App() {
     return document.visibilityState !== "visible" || !document.hasFocus();
   }
 
-  async function notifyWhenAway(label: string) {
+  async function notifyWhenAway(label: string, body = `${label} 已完成`) {
     if (!userIsAwayFromUi()) return;
     try {
       let allowed = await isPermissionGranted();
@@ -1461,7 +1453,7 @@ function App() {
       if (allowed) {
         sendNotification({
           title: "UnrealImageMaker",
-          body: `${label} 已完成`
+          body
         });
       }
     } catch (error) {
@@ -1498,7 +1490,11 @@ function App() {
         await notifyWhenAway(label);
       }
     } catch (error) {
-      pushLog(`${label}失败：${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      pushLog(`${label}失败：${message}`);
+      if (options.notify !== false) {
+        await notifyWhenAway(label, `${label} 失败：${message}`);
+      }
     } finally {
       polling = false;
       await pollTask;
@@ -1598,7 +1594,7 @@ function App() {
       setAssetName(state.assetName);
     }
     if (state.pixelKind && ["character", "weapon", "decoration", "tilemap"].includes(state.pixelKind)) setPixelKind(state.pixelKind);
-    if (state.pixelStage && ["concept", "south_anchor", "neutral_anchor", "direction_anchor", "sheet", "cutout", "normalize", "tilemap"].includes(state.pixelStage)) {
+    if (state.pixelStage && ["concept", "south_anchor", "neutral_anchor", "direction_anchor", "sheet", "cutout", "normalize", "tilemap_seed", "tilemap_tileset"].includes(state.pixelStage)) {
       setPixelStage(state.pixelStage);
     }
     if (state.pixelAction) setPixelActionFromId(state.pixelAction);
@@ -1681,6 +1677,10 @@ function App() {
 
   function currentTilemapRole() {
     return pixelTilemapStandard === "dual-grid-16" ? "tileset:dual-grid-16" : "tileset:47";
+  }
+
+  function currentTilemapPreviewRole() {
+    return `preview:tilemap:${pixelTilemapStandard}`;
   }
 
   function runtimeRole(actionId = currentPixelActionId(), direction = currentSheetDirection()) {
@@ -2021,7 +2021,6 @@ function App() {
 
   function activePixelStageForBrowser() {
     if (pixelKind === "tilemap") return "tilemap";
-    if (pixelStage === "tilemap") return "concept";
     return pixelStage;
   }
 
@@ -2115,9 +2114,17 @@ function App() {
       };
     }
     return {
-      title: `${tilemapStandardOption.label}规则清单`,
+      title: `${tilemapStandardOption.label}地形集`,
       inputVersions: [],
-      outputVersions: versionsByMatchers([roleMatcherExact(currentTilemapRole())])
+      outputVersions: versionsByMatchers([
+        roleMatcherExact("seed:tilemap-3x3"),
+        roleMatcherExact("source:tilemap:materials"),
+        roleMatcherExact("source:tilemap:wang-5x3-hard"),
+        roleMatcherExact("mask:tilemap:wang-5x3-boundary"),
+        roleMatcherExact("source:tilemap:wang-5x3"),
+        roleMatcherExact(currentTilemapRole()),
+        roleMatcherExact(currentTilemapPreviewRole())
+      ])
     };
   }
 
@@ -2867,10 +2874,10 @@ function App() {
     const isDefaultI2vDescription = Object.values(DEFAULT_PIXEL_I2V_ACTION_DESCRIPTIONS).includes(pixelI2vActionDescription.trim());
     setPixelKind(kind);
     if (options.resetStage) {
-      setPixelStage(kind === "tilemap" ? "tilemap" : "concept");
-    } else if (kind === "tilemap") {
-      setPixelStage("tilemap");
-    } else if (pixelStage === "tilemap") {
+      setPixelStage(kind === "tilemap" ? "tilemap_seed" : "concept");
+    } else if (kind === "tilemap" && !["tilemap_seed", "tilemap_tileset"].includes(pixelStage)) {
+      setPixelStage("tilemap_seed");
+    } else if (kind !== "tilemap" && ["tilemap_seed", "tilemap_tileset"].includes(pixelStage)) {
       setPixelStage("concept");
     }
     if (kind !== "tilemap" && isDefaultSubject) {
@@ -2907,6 +2914,14 @@ function App() {
       return `动作视频：${action || "动作"}${direction ? ` / ${pixelDirectionLabel(direction)}` : ""}`;
     }
     if (role.startsWith("runtime:")) return `运行时序列图：${role.slice("runtime:".length)}`;
+    if (role === "seed:tilemap-3x3") return "地形风格参考图";
+    if (role === "guide:tilemap:wang-5x3") return "5x3 Wang 约束图";
+    if (role === "source:tilemap:materials") return "地形材质对";
+    if (role === "source:tilemap:wang-5x3-hard") return "程序硬拼 5x3";
+    if (role === "mask:tilemap:wang-5x3-boundary") return "边界精修蒙版";
+    if (role === "source:tilemap:wang-5x3") return "边界精修 5x3 源图";
+    if (role === "preview:tilemap:47-tile") return "47 图块测试拼图";
+    if (role === "preview:tilemap:dual-grid-16") return "双网格测试拼图";
     if (role.startsWith("preview:")) return `预览图：${role.slice("preview:".length)}`;
     if (role === "tileset") return "地形集";
     if (role === "tileset:47") return "47 图块地形集";
@@ -4220,6 +4235,74 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     );
   }
 
+  async function generateTilemapSeedConcept() {
+    await runAction(
+      "生成地形风格参考图",
+      (streamSession) =>
+        api<Record<string, unknown>>("/specialized/pixel/tilemap-seed", {
+          method: "POST",
+          body: JSON.stringify({
+            project_root: projectRoot,
+            asset_name: assetName,
+            subject: pixelTilemapSubject,
+            standard: pixelTilemapStandard,
+            tile_size: pixelTileSize,
+            style_id: "pixel_art",
+            image_provider: imageProvider,
+            content_path: `${contentPath}/Tiles`,
+            stream_session: streamSession
+          })
+        }),
+      async (manifest) => {
+        const record = await handleSpecializedManifest(manifest);
+        const outputPath = firstManifestPath(manifest) || "";
+        if (outputPath) {
+          setPixelTilemapSeedPath(outputPath);
+          const version = record?.versions?.find((item) => item.path === outputPath);
+          setActivePreviewVersionId(version?.id ?? null);
+          setActivePreviewPath(outputPath);
+          setActivePreviewLabel(`${record?.name || assetName} / ${version ? versionDisplayLabel(version) : "地形风格参考图"}`);
+          setPixelStage("tilemap_tileset");
+        }
+      }
+    );
+  }
+
+  async function composeTilemapFromSeed() {
+    await runAction(
+      `生成材质、精修边界并组装 ${tilemapStandardOption.label}Tile Set`,
+      (streamSession) =>
+        api<Record<string, unknown>>("/specialized/pixel/tilemap-compose", {
+          method: "POST",
+          body: JSON.stringify({
+            project_root: projectRoot,
+            asset_name: assetName,
+            seed_path: pixelTilemapSeedPath,
+            subject: pixelTilemapSubject,
+            standard: pixelTilemapStandard,
+            tile_size: pixelTileSize,
+            style_id: "pixel_art",
+            image_provider: imageProvider,
+            content_path: `${contentPath}/Tiles`,
+            stream_session: streamSession
+          })
+        }),
+      async (manifest) => {
+        const record = await handleSpecializedManifest(manifest);
+        const files = Array.isArray(manifest.files) ? manifest.files as Array<{ role?: string; path?: string }> : [];
+        const previewFile = files.find((file) => file.role === currentTilemapPreviewRole());
+        const tilesetFile = files.find((file) => file.role === currentTilemapRole());
+        const outputPath = previewFile?.path || tilesetFile?.path || firstManifestPath(manifest) || "";
+        if (outputPath) {
+          const version = record?.versions?.find((item) => item.path === outputPath);
+          setActivePreviewVersionId(version?.id ?? null);
+          setActivePreviewPath(outputPath);
+          setActivePreviewLabel(`${record?.name || assetName} / ${version ? versionDisplayLabel(version) : tilemapStandardOption.label}`);
+        }
+      }
+    );
+  }
+
   async function createTilemapManifest() {
     const endpoint = pixelTilemapStandard === "dual-grid-16" ? "/specialized/pixel/tilemap-dual-grid" : "/specialized/pixel/tilemap-47";
     await runAction(
@@ -5028,62 +5111,6 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     return asset.versions?.find(isPreviewableImageVersion)?.path || asset.path || "";
   }
 
-  function AssetTreeRow({ node, style }: NodeRendererProps<AssetTreeNode>) {
-    const data = node.data;
-    const isActive = data.asset?.id === selectedAsset?.id;
-    const thumbnailPath = data.asset ? latestAssetThumbnailPath(data.asset) : "";
-    const thumbnailUrl = thumbnailPath ? previewUrlForPath(projectRoot, thumbnailPath) : "";
-    const handleOpen = () => {
-      if (data.kind === "group") {
-        node.toggle();
-        return;
-      }
-      if (data.asset) selectAssetFromTree(data.asset);
-    };
-    const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-      if (event.button !== 0) return;
-      event.preventDefault();
-      event.stopPropagation();
-      handleOpen();
-    };
-
-    return (
-      <div
-        className={`asset-tree-row ${data.kind} ${isActive ? "active" : ""}`}
-        aria-selected={isActive}
-        onContextMenu={(event) => {
-          if (!data.asset) return;
-          event.preventDefault();
-          setPendingDelete({ kind: "asset", asset: data.asset });
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            handleOpen();
-          }
-        }}
-        onPointerDown={handlePointerDown}
-        role="treeitem"
-        style={{ ...style, paddingLeft: `${8 + node.level * 14}px` }}
-        tabIndex={0}
-      >
-        <span className="asset-tree-icon" aria-hidden="true">
-          {data.kind === "group" ? (
-            node.isOpen ? <FolderOpen size={15} /> : <Folder size={15} />
-          ) : thumbnailUrl ? (
-            <img src={thumbnailUrl} alt="" />
-          ) : (
-            <FileImage size={14} />
-          )}
-        </span>
-        <span className="asset-tree-main">
-          <span className="asset-tree-name">{data.name}</span>
-          {data.kind === "asset" && data.asset && <span className="asset-tree-meta">{assetTypeLabel(data.asset.type)}</span>}
-        </span>
-      </div>
-    );
-  }
-
   async function clearWorkflowSlotAssetReferences(assetId: string) {
     let changed = false;
     const nextSlots: WorkflowSlots = { ...workflowSlots };
@@ -5142,251 +5169,12 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     }
   }
 
-  function ProjectSidebar() {
-    const hasOpenProject = Boolean(project?.project.id);
-    const currentProjectName = hasOpenProject ? project?.project.name || projectName || projectNameFromRoot(projectRoot) : "未打开项目";
-    const currentProjectPathLabel = hasOpenProject ? projectRoot : "选择文件夹后打开或创建项目";
-    const projectStatusLabel = backend === "online" ? "已连接" : backend === "checking" ? "连接中" : "离线";
-    const visibleRecentProjects = recentProjects.slice(0, 4);
-    const projectOperationDisabled = backend === "checking" || busy !== null;
-
+  function AssetPreview(options: { overridePath?: string; overrideName?: string } = {}) {
+    const PreviewPanel = AssetPreviewPanel as React.ComponentType<typeof options>;
     return (
-      <aside className="left-rail" aria-label="项目与资产">
-        <div className="brand-row">
-          <div className="product-mark">
-            <div className="product-icon">
-              <Wand2 size={20} />
-            </div>
-            <div>
-              <h1>UnrealImageMaker</h1>
-              <span>游戏贴图生产管线</span>
-            </div>
-          </div>
-        </div>
-
-        <section className="rail-section project-manager-section">
-          <div className="project-current-card">
-            <span className="project-current-icon">
-              <Database size={17} />
-            </span>
-            <div className="project-current-main">
-              <span className="section-kicker">当前项目</span>
-              <strong>{currentProjectName}</strong>
-              <small title={currentProjectPathLabel}>{currentProjectPathLabel}</small>
-            </div>
-            <span className={`project-status-pill ${backend}`}>{projectStatusLabel}</span>
-          </div>
-
-          <div className="project-mode-tabs" role="tablist" aria-label="项目操作">
-            <button
-              className={projectPanelMode === "open" ? "active" : ""}
-              onClick={() => setProjectPanelMode("open")}
-              type="button"
-              aria-selected={projectPanelMode === "open"}
-            >
-              <FolderOpen size={14} />
-              打开
-            </button>
-            <button
-              className={projectPanelMode === "create" ? "active" : ""}
-              onClick={() => setProjectPanelMode("create")}
-              type="button"
-              aria-selected={projectPanelMode === "create"}
-            >
-              <FolderPlus size={14} />
-              创建
-            </button>
-          </div>
-
-          <div className="project-form">
-            <label className="field compact">
-              <span>{projectPanelMode === "create" ? "新项目目录" : "项目目录"}</span>
-              <div className="project-folder-picker">
-                <input value={projectRoot || "未选择文件夹"} readOnly title={projectRoot} />
-              </div>
-            </label>
-            {projectPanelMode === "create" && (
-              <label className="field compact">
-                <span>项目名</span>
-                <input
-                  value={projectName}
-                  onChange={(event) => setProjectName(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      void createProject();
-                    }
-                  }}
-                  placeholder={projectNameFromRoot(projectRoot)}
-                />
-              </label>
-            )}
-          </div>
-
-          <div className="button-row project-submit-row">
-            {projectPanelMode === "create" ? (
-              <button className="primary-action" onClick={chooseAndCreateProject} disabled={projectOperationDisabled} type="button">
-                <FolderPlus size={15} />
-                创建
-              </button>
-            ) : (
-              <button className="primary-action" onClick={chooseAndOpenProject} disabled={projectOperationDisabled} type="button">
-                <FolderOpen size={15} />
-                打开
-              </button>
-            )}
-            <button className="secondary-action" onClick={disconnectProject} disabled={!hasOpenProject || busy !== null} type="button">
-              <X size={14} />
-              断开
-            </button>
-          </div>
-
-          {workerBlocked && (
-            <div className="rail-warning">
-              <span>本地服务未连接。打开或创建项目时会自动尝试启动后端。</span>
-            </div>
-          )}
-
-          {!hasOpenProject && (
-            <div className="recent-projects">
-              <div className="recent-project-header">
-                <span>
-                  <History size={13} />
-                  最近打开
-                </span>
-                {recentProjects.length > visibleRecentProjects.length && <small>显示最近 {visibleRecentProjects.length} 个</small>}
-              </div>
-              {visibleRecentProjects.length > 0 ? (
-                <div className="recent-project-list">
-                  {visibleRecentProjects.map((item) => (
-                    <div className="recent-project-row" key={item.root}>
-                      <button className="recent-project-main" onClick={() => openProject(item.root, item.name)} disabled={projectOperationDisabled} type="button">
-                        <strong>{item.name || projectNameFromRoot(item.root)}</strong>
-                        <small title={item.root}>{item.root}</small>
-                        <em>{formatRecentProjectTime(item.lastOpenedAt)}</em>
-                      </button>
-                      <button
-                        className="icon-action compact-icon recent-project-remove"
-                        onClick={() => forgetRecentProject(item.root)}
-                        aria-label={`从最近项目移除 ${item.name}`}
-                        type="button"
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="recent-project-empty">创建或打开项目后会保留在这里。</div>
-              )}
-            </div>
-          )}
-        </section>
-
-        {hasOpenProject && (
-          <section className="rail-section current-asset-section">
-            <div className="section-header">
-              <div>
-                <div className="section-kicker">当前资产</div>
-                <strong>{selectedAsset?.name || "新资产"}</strong>
-              </div>
-              <FileImage size={18} />
-            </div>
-            {assetTreeData.length > 0 && (
-              <Tree<AssetTreeNode>
-                aria-label="已有资产树"
-                className="asset-tree"
-                data={assetTreeData}
-                disableDrag
-                disableDrop
-                disableEdit
-                disableMultiSelection
-                height={Math.min(260, Math.max(128, assetTreeData.reduce((rows, group) => rows + 1 + (group.children?.length ?? 0), 0) * 34 + 8))}
-                indent={14}
-                openByDefault
-                rowHeight={34}
-                selection={assetTreeSelectionId}
-                width="100%"
-              >
-                {AssetTreeRow}
-              </Tree>
-            )}
-          </section>
-        )}
-      </aside>
-    );
-  }
-
-  function RightPanel() {
-    return (
-      <aside className="right-rail" aria-label="工作台概览与日志">
-        <section className="side-panel">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">概览</div>
-              <strong>当前工作台</strong>
-            </div>
-            <Database size={17} />
-          </div>
-          <div className="rail-metrics">
-            <span>
-              <strong>{assets.length}</strong>
-              <small>资产</small>
-            </span>
-            <span>
-              <strong>{installedCount}</strong>
-              <small>模型</small>
-            </span>
-            <span>
-              <strong>{issueCount}</strong>
-              <small>问题</small>
-            </span>
-          </div>
-          <div className="rail-context">
-            <div className="section-kicker">上下文</div>
-            <RailContext />
-          </div>
-        </section>
-
-        <section className="side-panel console-panel" aria-live="polite">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">日志</div>
-              <strong>{busy ? `执行中：${busy}` : "任务日志"}</strong>
-            </div>
-            {busy && activeStreamSession ? (
-              <button className="secondary-action compact" onClick={cancelActiveTask} disabled={cancelRequested} type="button">
-                {cancelRequested ? "中断中" : "中断任务"}
-              </button>
-            ) : (
-              <FileJson size={16} />
-            )}
-          </div>
-          {busy && taskProgress ? (
-            <div className="task-progress" role="progressbar" aria-valuemin={0} aria-valuemax={taskProgress.total} aria-valuenow={taskProgress.current}>
-              <div className="task-progress-meta">
-                <span>{taskProgress.label}</span>
-                <strong>{Math.round((taskProgress.current / taskProgress.total) * 100)}%</strong>
-              </div>
-              <div className="task-progress-track">
-                <div style={{ width: `${Math.max(2, Math.min(100, (taskProgress.current / taskProgress.total) * 100))}%` }} />
-              </div>
-            </div>
-          ) : null}
-          <div className="console-output" ref={consoleOutputRef} onScroll={handleConsoleScroll} role="log">
-            {log.length === 0 ? (
-              <div className="console-line muted">等待操作</div>
-            ) : (
-              log.map((item, index) => (
-                <div className="console-line" key={`${item}-${index}`}>
-                  <span className="console-prefix">{String(index + 1).padStart(2, "0")}</span>
-                  <span>{item}</span>
-                </div>
-              ))
-            )}
-          </div>
-        </section>
-      </aside>
+      <Suspense fallback={null}>
+        <PreviewPanel {...options} />
+      </Suspense>
     );
   }
 
@@ -5404,159 +5192,6 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
           重连
         </button>
       </div>
-    );
-  }
-
-  function ImageVersionTreeRow({ node, style }: NodeRendererProps<ImageVersionTreeNode>) {
-    const data = node.data;
-    const isActive = Boolean(data.version && (data.version.id === activePreviewVersionId || data.version.path === activePreviewPath));
-    const handleOpen = () => {
-      if (data.kind === "folder") {
-        node.toggle();
-        return;
-      }
-      if (data.kind === "file" && data.version) {
-        setActivePreviewVersionId(data.version.id);
-        setActivePreviewPath(data.version.path);
-        setActivePreviewLabel(`${selectedAsset?.name || activeAssetName} / ${versionDisplayLabel(data.version)}`);
-      }
-    };
-
-    const row = (
-      <div
-        className={`image-tree-row ${data.kind} ${isActive ? "active" : ""}`}
-        onClick={handleOpen}
-        onContextMenu={(event) => {
-          if (!data.version) return;
-          event.preventDefault();
-          setPendingDelete({ kind: "version", version: data.version });
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            handleOpen();
-          }
-        }}
-        role="treeitem"
-        style={{ ...style, paddingLeft: `${12 + node.level * 14}px` }}
-        tabIndex={0}
-      >
-        <span className="image-tree-icon" aria-hidden="true">
-          {data.kind === "folder" ? node.isOpen ? <FolderOpen size={16} /> : <Folder size={16} /> : <FileImage size={15} />}
-        </span>
-        <span className="image-tree-main">
-          <span className="image-tree-name">
-            {data.name}
-            {data.kind === "folder" && <em>{data.count ?? 0}</em>}
-          </span>
-          {data.kind === "file" && (
-            <span className="image-tree-meta">
-              {data.roleLabel}
-              {data.dateLabel ? ` · ${data.dateLabel}` : ""}
-            </span>
-          )}
-        </span>
-      </div>
-    );
-
-    if (!data.version) return row;
-
-    return row;
-  }
-
-  function ImageVersionBrowser() {
-    const { title, data } = currentImageBrowserTree();
-    const treeHeight = Math.max(160, previewHeight - 72);
-    const inputCount = data[0]?.count ?? 0;
-    const outputCount = data[1]?.count ?? 0;
-
-    return (
-      <aside className="image-version-browser" aria-label="当前工序图片树">
-        <div className="image-browser-header">
-          <div>
-            <span>当前工序</span>
-            <strong>{title}</strong>
-          </div>
-          <small>
-            输入 {inputCount} / 输出 {outputCount}
-          </small>
-        </div>
-        {selectedAsset ? (
-          <Tree<ImageVersionTreeNode>
-            aria-label="当前工序输入输出图片"
-            className="image-tree"
-            data={data}
-            disableDrag
-            disableDrop
-            disableEdit
-            disableMultiSelection
-            height={treeHeight}
-            indent={14}
-            openByDefault
-            rowHeight={36}
-            selection={activePreviewVersionId ? `output:${activePreviewVersionId}` : undefined}
-            width="100%"
-          >
-            {ImageVersionTreeRow}
-          </Tree>
-        ) : (
-          <div className="image-tree-empty">
-            <FileImage size={22} />
-            <span>先在左侧选择或创建当前资产</span>
-          </div>
-        )}
-      </aside>
-    );
-  }
-
-  function AssetPreview(options: { overridePath?: string; overrideName?: string } = {}) {
-    const displayPreviewPath = options.overridePath || previewPath;
-    const displayPreviewName = options.overrideName || previewName;
-    const displayPreviewUrl = previewUrlForPath(projectRoot, displayPreviewPath);
-    return (
-      <section className="preview-panel" aria-label="资产预览" style={{ height: previewHeight }}>
-        <div className="preview-browser-layout">
-          <ImageVersionBrowser />
-          <div className="checkerboard">
-            {displayPreviewPath && displayPreviewUrl ? (
-              <PhotoView src={displayPreviewUrl}>
-                <button className="preview-image-button" type="button" aria-label="放大查看当前图片">
-                  <img className="preview-image" src={displayPreviewUrl} alt={displayPreviewName || "资产预览"} />
-                </button>
-              </PhotoView>
-            ) : (
-              <div className="preview-object">
-                {displayPreviewPath ? (
-                  <FileImage size={44} />
-                ) : (
-                  <>
-                    <Sparkles size={44} />
-                    <strong>选择工序开始生产</strong>
-                    <span>生成结果会显示在这里，可拖动下边界调整预览高度。</span>
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-        <div
-          className="preview-resize-handle"
-          onPointerDown={startPreviewResize}
-          onPointerMove={movePreviewResize}
-          onPointerUp={endPreviewResize}
-          onPointerCancel={endPreviewResize}
-          role="separator"
-          aria-label="拖动调整图片显示器高度"
-        >
-          <span />
-        </div>
-        <div className="pipeline-bar">
-          <span className={project ? "done" : ""}>项目</span>
-          <span className={selectedAsset ? "done" : ""}>资产</span>
-          <span className={currentManifest ? "done" : ""}>清单</span>
-          <span className={lastResult ? "done" : ""}>结果</span>
-        </div>
-      </section>
     );
   }
 
@@ -5626,2038 +5261,6 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     );
   }
 
-  function PixelSpritesheetPage() {
-    const isCharacter = pixelKind === "character";
-    const isTilemap = pixelKind === "tilemap";
-    const kindCopy = pixelKindCopy(pixelKind);
-    const activePixelStage = isTilemap ? "tilemap" : pixelStage === "tilemap" ? "concept" : pixelStage;
-    const seedanceAnchorCandidate = anchorPathForDirection(currentVideoDirection());
-    const seedanceDefaultModel = defaultSeedanceModel();
-    const seedanceDefaultResolution = defaultSeedanceResolution();
-    const activeSeedanceModel = currentSeedanceModel();
-    const activeSeedanceResolution = currentSeedanceResolution();
-    const workspaceSeedanceModelOptions = [
-      ...(SEEDANCE_MODEL_OPTIONS.some((option) => option.value === seedanceDefaultModel)
-        ? []
-        : [{ value: seedanceDefaultModel, label: `${seedanceDefaultModel}（默认）`, description: "设置页默认" }]),
-      ...SEEDANCE_MODEL_OPTIONS.map((option) =>
-        option.value === seedanceDefaultModel
-          ? { ...option, label: `${option.label}（默认）`, description: option.description ? `设置页默认 · ${option.description}` : "设置页默认" }
-          : option
-      )
-    ];
-    const workspaceSeedanceResolutionOptions = seedanceResolutionOptions(activeSeedanceModel, seedanceDefaultResolution).map((resolution) => ({
-      value: resolution,
-      label: resolution === seedanceDefaultResolution ? `${resolution}（默认）` : resolution,
-      description: resolution === seedanceDefaultResolution ? "设置页默认" : undefined
-    }));
-    const pixelWorkflowSteps: Array<{ id: PixelStage; label: string; detail: string }> = isTilemap
-      ? [{ id: "tilemap", label: `${tilemapStandardOption.shortLabel}地形`, detail: `导入地形集图片并生成${tilemapStandardOption.label}规则清单` }]
-      : isCharacter
-        ? [
-            { id: "concept", label: "角色概念图", detail: "确定轮廓、配色、气质" },
-            { id: "south_anchor", label: "正面基准图", detail: "文本 + 像素网格" },
-            { id: "neutral_anchor", label: "中性姿态修正", detail: "移除火球、光效等动态元素" },
-            { id: "direction_anchor", label: "方向基准图", detail: "生成左侧/背面/右侧" },
-            { id: "sheet", label: "动作序列图", detail: "直接生成或图生视频" },
-            { id: "cutout", label: "背景透明化", detail: "Hybrid Mask 去背景" },
-            { id: "normalize", label: "归一化", detail: "定脚底、裁切、重打包" }
-          ]
-        : [
-            { id: "concept", label: kindCopy.conceptTitle, detail: kindCopy.conceptStepDetail },
-            { id: "south_anchor", label: kindCopy.anchorTitle, detail: kindCopy.anchorStepDetail },
-            { id: "sheet", label: kindCopy.sheetTitle, detail: kindCopy.sheetStepDetail },
-            { id: "cutout", label: "背景透明化", detail: "Hybrid Mask 去背景" },
-            { id: "normalize", label: "归一化", detail: "裁切、重打包" }
-          ];
-
-    function switchPixelKind(kind: PixelKind) {
-      applyPixelKindSelection(kind, { resetStage: true });
-    }
-
-    function StageNav() {
-      return (
-        <nav className="workflow-steps" aria-label="像素生产阶段">
-          {pixelWorkflowSteps.map((step, index) => (
-            <button
-              className={activePixelStage === step.id ? "active" : ""}
-              key={step.id}
-              onClick={() => setPixelStage(step.id)}
-              type="button"
-            >
-              <span className="step-index">{index + 1}</span>
-              <span>
-                <strong>{step.label}</strong>
-                <small>{step.detail}</small>
-              </span>
-            </button>
-          ))}
-        </nav>
-      );
-    }
-
-    function PixelActionCommandField({ className = "" }: { className?: string }) {
-      const queryValue = pixelActionQuery.trim();
-      const canUseCustom = queryValue && !pixelActionOptions.some((option) => option.value.toLowerCase() === assetIdFromName(queryValue).toLowerCase());
-      const selected = pixelActionOptions.find((option) => option.value === currentPixelActionId());
-      const actionComboboxDismiss = useDismissableCombobox<HTMLDivElement>(setPixelActionMenuOpen);
-      const chooseAction = (value: string) => {
-        setPixelActionFromId(value);
-        setPixelActionQuery("");
-        setPixelActionMenuOpen(false);
-      };
-      return (
-        <div className={`field ${className}`.trim()}>
-          <span>动作</span>
-          <div
-            className="cmdk-combobox action-combobox"
-            onBlur={actionComboboxDismiss.handleBlur}
-            onKeyDown={actionComboboxDismiss.handleKeyDown}
-            ref={actionComboboxDismiss.rootRef}
-          >
-            <button className="cmdk-combobox-trigger" onClick={() => setPixelActionMenuOpen((current) => !current)} type="button">
-              <span>
-                <strong>{selected?.label || currentPixelActionLabel()}</strong>
-                <small>{selected?.description || currentPixelActionId()}</small>
-              </span>
-              <ChevronDown size={16} />
-            </button>
-            {pixelActionMenuOpen && (
-              <Command className="cmdk-combobox-menu" shouldFilter>
-                <Command.Input autoFocus value={pixelActionQuery} onValueChange={setPixelActionQuery} placeholder="搜索动作，或输入新动作名" />
-                <Command.List>
-                  <Command.Empty>没有匹配动作</Command.Empty>
-                  <Command.Group>
-                    {pixelActionOptions.map((option) => (
-                      <Command.Item key={option.value} value={`${option.label} ${option.value} ${option.description || ""}`} onSelect={() => chooseAction(option.value)}>
-                        <span>
-                          <strong>{option.label}</strong>
-                          <small>{option.value}{option.description ? ` · ${option.description}` : ""}</small>
-                        </span>
-                        {option.value === currentPixelActionId() && <Check size={15} />}
-                      </Command.Item>
-                    ))}
-                    {canUseCustom && (
-                      <Command.Item value={queryValue} onSelect={() => chooseAction(queryValue)}>
-                        <span>
-                          <strong>使用“{queryValue}”</strong>
-                          <small>新动作</small>
-                        </span>
-                        <CheckCircle2 size={15} />
-                      </Command.Item>
-                    )}
-                  </Command.Group>
-                </Command.List>
-              </Command>
-            )}
-          </div>
-          <small className="field-hint">已有动作来自当前资产；也可以直接输入新动作名。</small>
-        </div>
-      );
-    }
-
-    function PixelGlobals() {
-      return (
-        <section className="subpanel no-border">
-          <div className="module-switcher" role="tablist" aria-label="像素工作流">
-            {(["character", "weapon", "decoration", "tilemap"] as PixelKind[]).map((kind) => (
-              <button className={pixelKind === kind ? "active" : ""} key={kind} onClick={() => switchPixelKind(kind)} type="button">
-                {pixelKindLabel(kind)}
-              </button>
-            ))}
-          </div>
-          <div className="two-col">
-            <label className="field">
-              <span>资产名</span>
-              <input value={assetName} onChange={(event) => setAssetName(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>生成方式</span>
-              <select value={imageProvider} onChange={(event) => setImageProvider(event.target.value as ImageProvider)}>
-                <option value="openai_api">OpenAI 密钥（gpt-image-2）</option>
-                <option value="codex_oauth">ChatGPT 订阅账号</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>逻辑帧尺寸</span>
-              <input type="number" min={16} step={16} value={pixelCellSize} onChange={(event) => updatePixelCellSize(Number(event.target.value))} />
-            </label>
-            <label className="field">
-              <span>基准图输出尺寸</span>
-              <select value={pixelAnchorOutputSize} onChange={(event) => updatePixelAnchorOutputSize(event.target.value)}>
-                {anchorOutputOptions.length === 0 && <option value={pixelAnchorOutputSize}>没有可用的整数倍尺寸</option>}
-                {anchorOutputOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.value}（逻辑帧 {option.scale}x）
-                  </option>
-                ))}
-              </select>
-              <small>基准图按逻辑帧尺寸整数倍生成，参考项目默认是 256 到 1024（4x）。</small>
-            </label>
-          </div>
-        </section>
-      );
-    }
-
-    function PixelStagePanel() {
-      if (activePixelStage === "tilemap") {
-        return (
-          <section className="stage-card">
-            <div className="section-header">
-              <div>
-                <div className="section-kicker">地形集</div>
-                <strong>{tilemapStandardOption.label}规则清单</strong>
-              </div>
-              <Layers size={18} />
-            </div>
-            <p className="field-hint">{tilemapStandardOption.description}</p>
-            <div className="three-col">
-              <label className="field span-2">
-                <span>地形集图片路径</span>
-                <input value={pixelTileSetPath} onChange={(event) => setPixelTileSetPath(event.target.value)} placeholder="项目内相对路径或绝对路径" />
-              </label>
-              <label className="field">
-                <span>自动地形标准</span>
-                <select value={pixelTilemapStandard} onChange={(event) => setPixelTilemapStandard(event.target.value as TilemapStandard)}>
-                  {TILEMAP_STANDARD_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-                <small>{tilemapStandardOption.detail}</small>
-              </label>
-              <label className="field">
-                <span>逻辑图块尺寸</span>
-                <input type="number" value={pixelTileSize} onChange={(event) => setPixelTileSize(Number(event.target.value))} />
-              </label>
-              <label className="field span-2">
-                <span>UE 内容路径</span>
-                <input value={contentPath} onChange={(event) => setContentPath(event.target.value)} />
-              </label>
-            </div>
-            <button className="run-button" onClick={createTilemapManifest} disabled={disabled || !pixelTileSetPath.trim()}>
-              <FileJson size={17} />
-              生成{tilemapStandardOption.label}规则清单
-            </button>
-          </section>
-        );
-      }
-
-      if (activePixelStage === "concept") {
-        return (
-          <section className="stage-card">
-            <div className="section-header">
-              <div>
-                <div className="section-kicker">阶段 0</div>
-                <strong>{kindCopy.conceptTitle}</strong>
-              </div>
-              <Wand2 size={18} />
-            </div>
-            <p className="field-hint">{kindCopy.conceptHint.replace("{size}", pixelAnchorOutputSize)}</p>
-            <label className="field">
-              <span>{kindCopy.subjectLabel}</span>
-              <textarea className="short-textarea" value={pixelSubject} onChange={(event) => setPixelSubject(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>概念图路径（可选记录）</span>
-              <input value={pixelConceptPath} onChange={(event) => setPixelConceptPath(event.target.value)} placeholder="可留空；正面基准图只使用文本和像素网格" />
-            </label>
-            <button className="run-button" onClick={generatePixelConcept} disabled={disabled}>
-              <Wand2 size={17} />
-              {kindCopy.conceptButton}
-            </button>
-          </section>
-        );
-      }
-
-      if (activePixelStage === "south_anchor") {
-        return (
-          <section className="stage-card">
-            <div className="section-header">
-              <div>
-                <div className="section-kicker">阶段 1</div>
-                <strong>{kindCopy.anchorTitle}</strong>
-              </div>
-              <Sparkles size={18} />
-            </div>
-            <p className="field-hint">{kindCopy.anchorHint}</p>
-            <label className="field">
-              <span>{kindCopy.subjectLabel}</span>
-              <textarea className="short-textarea" value={pixelSubject} onChange={(event) => setPixelSubject(event.target.value)} />
-            </label>
-            <label className="toggle-row">
-              <input type="checkbox" checked={pixelAnchorUseConcept} onChange={(event) => setPixelAnchorUseConcept(event.target.checked)} />
-              <span>使用概念图作为基准图参考</span>
-            </label>
-            <div className="three-col">
-              <label className="field span-3">
-                <span>背景</span>
-                <input value={pixelAnchorUseConcept ? `概念图 + 像素网格 + #FF00FF 抠图色` : "文本 + 像素网格 + #FF00FF 抠图色"} readOnly />
-              </label>
-            </div>
-            {pixelAnchorUseConcept && !anchorConceptReferencePath() && <p className="field-hint warning">开启概念图参考时，需要先生成或填写当前资产的概念图路径。</p>}
-            <button className="run-button" onClick={() => generatePixelAnchor("south")} disabled={disabled || (pixelAnchorUseConcept && !anchorConceptReferencePath())}>
-              <Sparkles size={17} />
-              {kindCopy.anchorButton}
-            </button>
-          </section>
-        );
-      }
-
-      if (activePixelStage === "neutral_anchor") {
-        return (
-          <section className="stage-card">
-            <div className="section-header">
-              <div>
-                <div className="section-kicker">阶段 2</div>
-                <strong>中性姿态修正</strong>
-              </div>
-              <Eraser size={18} />
-            </div>
-            <p className="field-hint">当正面基准图带了火球、光效、武器挥动或施法姿势时，用“已有正面基准图 + 像素网格”重新生成无动态效果版本。</p>
-            <SlotPicker
-              group="pixel"
-              slotKey="southAnchor"
-              label="正面基准图"
-              roles={["anchor:south", "anchor:single"]}
-              description="中性姿态修正会读取这里的基准图。默认自动使用当前资产最新正面基准图。"
-            />
-            <div className="two-col">
-              <label className="field span-2">
-                <span>要移除的动态效果</span>
-                <textarea className="short-textarea" value={pixelDynamicEffect} onChange={(event) => setPixelDynamicEffect(event.target.value)} />
-              </label>
-            </div>
-            <button className="run-button" onClick={() => generatePixelAnchor("neutral")} disabled={disabled || !anchorPathForDirection("south")}>
-              <Eraser size={17} />
-              生成中性正面基准图
-            </button>
-          </section>
-        );
-      }
-
-      if (activePixelStage === "direction_anchor") {
-        return (
-          <section className="stage-card">
-            <div className="section-header">
-              <div>
-                <div className="section-kicker">阶段 3</div>
-                <strong>方向基准图</strong>
-              </div>
-              <Layers size={18} />
-            </div>
-            <p className="field-hint">左侧、背面、右侧都可以独立生成；选择右侧时也可以手动改为从左侧水平镜像生成。</p>
-            <SlotPicker
-              group="pixel"
-              slotKey="southAnchor"
-              label="身份基准图"
-              roles={["anchor:south"]}
-              description="方向基准图会读取这里的正面身份图，并与像素网格合成参考图。"
-            />
-            <div className="two-col">
-              <label className="field">
-                <span>方向</span>
-                <select value={pixelDirection} onChange={(event) => setPixelDirection(event.target.value)}>
-                  <option value="west">左侧</option>
-                  <option value="north">背面</option>
-                  <option value="east">右侧</option>
-                </select>
-              </label>
-              {pixelDirection === "east" && (
-                <div className="field checkbox-field">
-                  <span>右侧来源</span>
-                  <label>
-                    <input type="checkbox" checked={pixelMirrorEastFromWest} onChange={(event) => setPixelMirrorEastFromWest(event.currentTarget.checked)} />
-                    由左侧镜像生成
-                  </label>
-                  <small className="field-hint">关闭时会调用图像模型独立生成右侧基准图。</small>
-                </div>
-              )}
-            </div>
-            {pixelDirection === "east" && !pixelMirrorEastFromWest && (
-              <p className="field-hint warning">右侧独立生成会同时读取正面基准图和左侧基准图；请先生成左侧，否则后端会拒绝生成。</p>
-            )}
-            <button className="run-button" onClick={() => generatePixelAnchor("direction")} disabled={disabled}>
-              <Layers size={17} />
-              {pixelDirection === "east" && pixelMirrorEastFromWest ? "镜像右侧基准图" : "生成方向基准图"}
-            </button>
-          </section>
-        );
-      }
-
-      if (activePixelStage === "sheet") {
-        return (
-          <section className="stage-card">
-            <div className="section-header">
-              <div>
-                <div className="section-kicker">阶段 4</div>
-                <strong>{kindCopy.sheetTitle}</strong>
-              </div>
-              <Layers size={18} />
-            </div>
-            <div className="module-switcher sheet-mode-switcher" role="tablist" aria-label="动作序列图生成方式">
-              <button className={pixelSheetMode === "direct" ? "active" : ""} onClick={() => setPixelSheetMode("direct")} type="button">
-                直接生成序列图
-              </button>
-              <button className={pixelSheetMode === "video" ? "active" : ""} onClick={() => setPixelSheetMode("video")} type="button">
-                图生视频转序列图
-              </button>
-            </div>
-            <p className="field-hint">
-              {pixelSheetMode === "direct"
-                ? kindCopy.sheetDirectHint
-                : "视频模式适合行走、攻击等连续性要求高的动作；当前先生成动作视频，并保持在同一工序内管理。"}
-            </p>
-            <SlotPicker
-              group="pixel"
-              slotKey="directionAnchor"
-              label={kindCopy.anchorSlotLabel}
-              roles={[`anchor:${isCharacter ? (pixelSheetMode === "video" ? currentVideoDirection() : pixelDirection) : "single"}`]}
-              description={pixelSheetMode === "direct" ? kindCopy.anchorSlotDescription : "图生视频只使用这一张方向基准图作为图片输入。"}
-            />
-            {pixelSheetMode === "direct" ? (
-              <>
-                <div className="three-col">
-                  <PixelActionCommandField />
-                  {isCharacter ? (
-                    <label className="field">
-                      <span>方向</span>
-                      <select value={pixelDirection} onChange={(event) => setPixelDirection(event.target.value)}>
-                        <option value="south">正面</option>
-                        <option value="west">左侧</option>
-                        <option value="north">背面</option>
-                        <option value="east">右侧</option>
-                      </select>
-                    </label>
-                  ) : (
-                    <label className="field">
-                      <span>方向</span>
-                      <input readOnly value="单物件" />
-                    </label>
-                  )}
-                  <label className="field">
-                    <span>单帧尺寸</span>
-                    <input type="number" value={pixelCellSize} onChange={(event) => updatePixelCellSize(Number(event.target.value))} />
-                  </label>
-                  {isCharacter && pixelDirection === "east" && (
-                    <div className="field checkbox-field">
-                      <span>右侧来源</span>
-                      <label>
-                        <input type="checkbox" checked={pixelMirrorEastFromWest} onChange={(event) => setPixelMirrorEastFromWest(event.currentTarget.checked)} />
-                        由左侧序列图镜像
-                      </label>
-                      <small className="field-hint">关闭时会使用右侧基准图独立生成右侧序列图。</small>
-                    </div>
-                  )}
-                  <label className="field">
-                    <span>列数</span>
-                    <input type="number" value={pixelColumns} onChange={(event) => setPixelColumns(Number(event.target.value))} />
-                  </label>
-                  <label className="field">
-                    <span>行数</span>
-                    <input type="number" value={pixelRows} onChange={(event) => setPixelRows(Number(event.target.value))} />
-                  </label>
-                  {pixelAction === "attack" && (
-                    <>
-                      <label className="field">
-                        <span>攻击名</span>
-                        <input value={pixelAttackName} onChange={(event) => setPixelAttackName(event.target.value)} />
-                      </label>
-                      <label className="field">
-                        <span>效果颜色</span>
-                        <input value={pixelEffectColor} onChange={(event) => setPixelEffectColor(event.target.value)} />
-                      </label>
-                      <label className="field">
-                        <span>投射物/效果</span>
-                        <input value={pixelProjectileEffect} onChange={(event) => setPixelProjectileEffect(event.target.value)} />
-                      </label>
-                    </>
-                  )}
-                  {!knownActionLabel(currentPixelActionId()) && (
-                    <>
-                      <label className="field">
-                        <span>显示名</span>
-                        <input value={pixelCustomActionName} onChange={(event) => setPixelCustomActionName(event.target.value)} placeholder="例如：闪避翻滚 / 施法 / 装填" />
-                      </label>
-                      <label className="field span-3">
-                        <span>动作描述</span>
-                        <textarea className="short-textarea" value={pixelActionDescription} onChange={(event) => setPixelActionDescription(event.target.value)} />
-                      </label>
-                    </>
-                  )}
-                </div>
-                <div className="button-row wrap">
-                  <button className="run-button" onClick={generatePixelSheet} disabled={disabled}>
-                    <Layers size={17} />
-                    生成{currentPixelActionLabel()}序列图
-                  </button>
-                  <button className="secondary-action tall" onClick={importPixelSheet} disabled={disabled} type="button">
-                    <FileImage size={15} />
-                    导入序列帧
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="three-col">
-                  <PixelActionCommandField />
-                  {isCharacter ? (
-                    <label className="field">
-                      <span>方向</span>
-                      <select value={currentVideoDirection()} onChange={(event) => setPixelDirection(event.target.value)}>
-                        <option value="south">正面</option>
-                        <option value="west">左侧</option>
-                        <option value="north">背面</option>
-                        <option value="east">右侧</option>
-                      </select>
-                    </label>
-                  ) : (
-                    <label className="field">
-                      <span>方向</span>
-                      <input readOnly value="单物件" />
-                    </label>
-                  )}
-                  <label className="field">
-                    <span>视频时长（秒）</span>
-                    <input type="number" min={4} max={15} value={pixelSeedanceSeconds} onChange={(event) => setPixelSeedanceSeconds(Number(event.target.value))} />
-                  </label>
-                  <div className="field span-3 seedance-workspace-field">
-                    <span>本次 Seedance 模型</span>
-                    <CommandCombobox
-                      value={activeSeedanceModel}
-                      onValueChange={updatePixelSeedanceModel}
-                      options={workspaceSeedanceModelOptions}
-                      placeholder={seedanceDefaultModel}
-                      searchPlaceholder="搜索 Seedance 模型"
-                    />
-                    <small className="field-hint">默认：{seedanceDefaultModel}，可为当前工作区生成覆盖选择。</small>
-                  </div>
-                  <div className="field span-3 seedance-workspace-field">
-                    <span>本次视频分辨率</span>
-                    <CommandCombobox
-                      value={activeSeedanceResolution}
-                      onValueChange={setPixelSeedanceResolution}
-                      options={workspaceSeedanceResolutionOptions}
-                      placeholder={seedanceDefaultResolution}
-                      searchPlaceholder="搜索或输入分辨率"
-                    />
-                    <small className="field-hint">默认：{seedanceDefaultResolution}，可用选项会随本次 Seedance 模型变化。</small>
-                  </div>
-                  <label className="field">
-                    <span>单帧尺寸</span>
-                    <input type="number" value={pixelCellSize} onChange={(event) => updatePixelCellSize(Number(event.target.value))} />
-                  </label>
-                  <label className="field">
-                    <span>自动布局</span>
-                    <input readOnly value={videoFrameSelections.length > 0 ? `${videoSheetLayoutForFrameCount(videoFrameSelections.length).columns} x ${videoSheetLayoutForFrameCount(videoFrameSelections.length).rows}` : "选帧后计算"} />
-                    <small className="field-hint">按已选帧数自动计算列数和行数。</small>
-                  </label>
-                  {!knownActionLabel(currentPixelActionId()) && (
-                    <label className="field">
-                      <span>显示名</span>
-                      <input value={pixelCustomActionName} onChange={(event) => setPixelCustomActionName(event.target.value)} placeholder="例如：闪避翻滚 / 施法 / 装填" />
-                    </label>
-                  )}
-                  <label className="field span-3">
-                    <span>图生视频动作描述</span>
-                    <textarea className="short-textarea" value={pixelI2vActionDescription} onChange={(event) => setPixelI2vActionDescription(event.target.value)} />
-                  </label>
-                  <label className="field span-3">
-                    <span>动作视频路径</span>
-                    <input value={pixelVideoPath} onChange={(event) => setPixelVideoPath(event.target.value)} placeholder={videoSourceSlot()?.version.path || "生成视频后自动填入，也可粘贴项目内相对路径或绝对路径"} />
-                  </label>
-                </div>
-                <button className="run-button" onClick={generateSeedanceVideo} disabled={disabled || !seedanceAnchorCandidate}>
-                  <Play size={17} />
-                  生成{currentPixelActionLabel()}动作视频
-                </button>
-                <div className="video-frame-summary video-frame-middle-step">
-                  <span>
-                    已选 {videoFrameSelections.length} 帧{videoFrameSelections.length > 0 ? `，自动打包为 ${videoSheetLayoutForFrameCount(videoFrameSelections.length).columns}x${videoSheetLayoutForFrameCount(videoFrameSelections.length).rows}` : "，选帧后自动计算布局"}
-                  </span>
-                  <button className="secondary-action" onClick={openVideoFramePicker} disabled={disabled || !currentVideoSourcePath()} type="button">
-                    <Scissors size={15} />
-                    选择视频帧
-                  </button>
-                </div>
-                <button className="run-button" onClick={generatePixelSheetFromVideo} disabled={disabled || !currentVideoSourcePath() || videoFrameSelections.length === 0}>
-                  <Layers size={17} />
-                  抽帧打包为序列图
-                </button>
-              </>
-            )}
-          </section>
-        );
-      }
-
-      if (activePixelStage === "cutout") {
-        return (
-          <section className="stage-card">
-            <div className="section-header">
-              <div>
-                <div className="section-kicker">阶段 5</div>
-                <strong>背景透明化</strong>
-              </div>
-              <Eraser size={18} />
-            </div>
-            <p className="field-hint">使用 Hybrid Mask 对当前动作序列图逐帧透明化：OpenCV 找边缘连通背景，rembg 提供语义参考，并保持每个 cell 的原始位置。</p>
-            <SlotPicker
-              group="pixel"
-              slotKey="cutoutSource"
-              label="待透明化序列图"
-              roles={[currentSheetRole()]}
-              description="默认读取动作序列图阶段最新生成的 Sheet。"
-            />
-            <div className="two-col">
-              <div className="field">
-                <span>Mask 模式</span>
-                <CommandCombobox
-                  value={pixelMaskMode}
-                  onValueChange={(value) => setPixelMaskMode(value as PixelMaskMode)}
-                  options={PIXEL_MASK_MODE_OPTIONS}
-                  placeholder="hybrid"
-                  searchPlaceholder="搜索透明化模式"
-                  allowCustom={false}
-                />
-              </div>
-              <label className="field">
-                <span>rembg 模型</span>
-                <select value={rembgModel} onChange={(event) => setRembgModel(event.target.value)}>
-                  <option value="isnet-general-use">isnet-general-use</option>
-                  <option value="isnet-anime">isnet-anime</option>
-                  <option value="u2netp">u2netp</option>
-                </select>
-              </label>
-              <label className="mini-toggle">
-                <input type="checkbox" checked={pixelDecontaminateEdges} onChange={(event) => setPixelDecontaminateEdges(event.currentTarget.checked)} />
-                白边去污染
-              </label>
-              <label className="mini-toggle">
-                <input type="checkbox" checked={pixelDebugArtifacts} onChange={(event) => setPixelDebugArtifacts(event.currentTarget.checked)} />
-                输出 debug mask
-              </label>
-            </div>
-            <button className="run-button" onClick={removePixelSheetBackground} disabled={disabled || !(pixelSheetPath || cutoutSourceSlot())}>
-              <Eraser size={17} />
-              透明化序列图背景
-            </button>
-          </section>
-        );
-      }
-
-      return (
-        <section className="stage-card">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">阶段 6</div>
-              <strong>归一化</strong>
-            </div>
-            <Scissors size={18} />
-          </div>
-          <p className="field-hint">读取透明化后的 Sheet，测透明区域、统一可见高度、锁定脚底基线、重建图集并生成预览图。</p>
-          <SlotPicker
-            group="pixel"
-            slotKey="normalizeSource"
-            label="归一化源图"
-            roles={[currentCutoutRole(), currentSheetRole()]}
-            description="默认优先读取背景透明化输出；没有透明化版本时才回退到原始动画 Sheet。"
-          />
-          <div className="three-col">
-            <label className="field span-2">
-              <span>行列</span>
-              <input readOnly value="自动从源 Sheet 尺寸推断" />
-            </label>
-            <label className="field">
-              <span>单帧尺寸</span>
-              <input type="number" value={pixelCellSize} onChange={(event) => updatePixelCellSize(Number(event.target.value))} />
-            </label>
-          </div>
-          <div className="field">
-            <span>像素修复</span>
-            <CommandCombobox
-              value={pixelRestoreMode}
-              onValueChange={(value) => setPixelRestoreMode(value as PixelRestoreMode)}
-              options={PIXEL_RESTORE_MODE_OPTIONS}
-              placeholder="none"
-              searchPlaceholder="搜索 unfake 模式"
-              allowCustom={false}
-            />
-          </div>
-          <button className="run-button" onClick={normalizePixelSheet} disabled={disabled || !(pixelCutoutPath || normalizeSourceSlot() || pixelSheetPath)}>
-            <Scissors size={17} />
-            归一化运行时序列图
-          </button>
-        </section>
-      );
-    }
-
-    function currentMatrixActionKey(): PixelMatrixActionKey {
-      return currentPixelActionId();
-    }
-
-    function MatrixStatusBadge({ cell }: { cell: PixelMatrixCellState }) {
-      return (
-        <span className={`matrix-status ${cell.status}`}>
-          {cell.status === "runtime" && <CheckCircle2 size={13} />}
-          {cell.status === "stale" && <RefreshCw size={13} />}
-          {cell.status === "cutout" && <Eraser size={13} />}
-          {cell.status === "sheet" && <Layers size={13} />}
-          {cell.status === "video" && <Play size={13} />}
-          {cell.status === "missing" && <FileImage size={13} />}
-          {cell.statusLabel}
-        </span>
-      );
-    }
-
-    function PixelMatrixWorkbench() {
-      const selectedCount = pixelMatrixSelection.length;
-      const activeKey = pixelMatrixCellKey(currentMatrixActionKey(), currentSheetDirection() as PixelMatrixDirection);
-      return (
-        <section className="pixel-workbench" aria-label="动作方向矩阵">
-          <div className="workbench-header">
-            <div>
-              <div className="section-kicker">资产工作台</div>
-              <strong>动作 x 方向矩阵</strong>
-              <span>点击格子编辑当前任务，勾选格子后批量执行后处理。</span>
-            </div>
-            <div className="batch-toolbar" aria-label="批处理操作">
-              <span>{selectedCount ? `已选 ${selectedCount} 项` : "未选择批处理项"}</span>
-              <button className="secondary-action" onClick={() => runPixelBatch("generate_missing")} disabled={disabled || selectedCount === 0} type="button">
-                <Sparkles size={15} />
-                生成缺失
-              </button>
-              <button className="secondary-action" onClick={() => runPixelBatch("cutout")} disabled={disabled || selectedCount === 0} type="button">
-                <Eraser size={15} />
-                背景透明化
-              </button>
-              <button className="secondary-action" onClick={() => runPixelBatch("normalize")} disabled={disabled || selectedCount === 0} type="button">
-                <Scissors size={15} />
-                归一化/预览
-              </button>
-              <button className="run-button compact" onClick={() => runPixelBatch("cutout_normalize")} disabled={disabled || selectedCount === 0} type="button">
-                <CheckCircle2 size={15} />
-                透明化+归一化
-              </button>
-              <button className="secondary-action icon-only" onClick={() => setPixelMatrixSelection([])} disabled={selectedCount === 0} type="button" aria-label="清空矩阵选择" title="清空选择">
-                <Trash2 size={15} />
-              </button>
-            </div>
-          </div>
-          <div className="pixel-matrix" role="grid" aria-label="动作方向状态">
-            <div className="matrix-corner">动作</div>
-            {pixelMatrixDirections.map((direction) => (
-              <div className="matrix-heading" key={direction}>
-                {pixelDirectionLabel(direction)}
-              </div>
-            ))}
-            {pixelMatrixActions.map((action) => (
-              <React.Fragment key={action.key}>
-                <div className="matrix-row-label">
-                  <strong>{action.label}</strong>
-                  <small>{action.id}</small>
-                </div>
-                {pixelMatrixDirections.map((direction) => {
-                  const cell = pixelMatrixCellState(action.key, direction);
-                  const selected = pixelMatrixSelection.includes(cell.key);
-                  const active = activeKey === cell.key;
-                  return (
-                    <div
-                      className={`matrix-cell ${selected ? "selected" : ""} ${active ? "active" : ""} ${cell.stale ? "stale" : ""}`}
-                      key={cell.key}
-                      onClick={() => handlePixelMatrixCellClick(action.key, direction)}
-                    >
-                      <label className="matrix-cell-top" onClick={(event) => event.stopPropagation()}>
-                        <input
-                          aria-label={`选择 ${cell.actionLabel} ${cell.directionLabel}`}
-                          checked={selected}
-                          onClick={(event) => event.stopPropagation()}
-                          onChange={() => togglePixelMatrixCell(action.key, direction)}
-                          type="checkbox"
-                        />
-                        <MatrixStatusBadge cell={cell} />
-                      </label>
-                      <button
-                        className="matrix-cell-button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          handlePixelMatrixCellClick(action.key, direction);
-                        }}
-                        type="button"
-                      >
-                        <strong>{cell.directionLabel}</strong>
-                        <small>{cell.preview ? browserVersionDate(cell.preview) : cell.runtime ? browserVersionDate(cell.runtime) : cell.cutout ? browserVersionDate(cell.cutout) : cell.sheet ? browserVersionDate(cell.sheet) : "没有产物"}</small>
-                      </button>
-                    </div>
-                  );
-                })}
-              </React.Fragment>
-            ))}
-          </div>
-        </section>
-      );
-    }
-
-    function BatchQueuePanel() {
-      return (
-        <section className="batch-queue-panel" aria-label="批处理队列">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">批处理队列</div>
-              <strong>串行执行状态</strong>
-            </div>
-            <RefreshCw size={18} />
-          </div>
-          {pixelBatchQueue.length === 0 ? (
-            <p className="field-hint">勾选矩阵格子后执行批处理，队列会显示每个方向/动作的阶段和日志。</p>
-          ) : (
-            <div className="batch-task-list">
-              {pixelBatchQueue.map((task) => (
-                <article className={`batch-task ${task.status}`} key={task.id}>
-                  <div className="batch-task-main">
-                    <strong>
-                      {pixelMatrixActionLabel(task.actionKey)} / {pixelDirectionLabel(task.direction)}
-                    </strong>
-                    <span>{task.currentStep ? `正在执行 ${task.currentStep}` : task.status === "done" ? "完成" : task.status === "failed" ? "失败" : "等待"}</span>
-                  </div>
-                  <div className="batch-task-steps">
-                    {task.steps.map((step) => (
-                      <span className={task.currentStep === step ? "active" : ""} key={step}>
-                        {step}
-                      </span>
-                    ))}
-                  </div>
-                  {task.error && <p className="batch-error">{task.error}</p>}
-                  {task.logs.length > 0 && (
-                    <div className="batch-task-log">
-                      {task.logs.slice(-4).map((entry, index) => (
-                        <span key={`${task.id}:${index}`}>{entry}</span>
-                      ))}
-                    </div>
-                  )}
-                  {task.status === "failed" && (
-                    <button className="secondary-action" onClick={() => runPixelBatch("cutout_normalize", task)} disabled={disabled} type="button">
-                      <RefreshCw size={15} />
-                      重试
-                    </button>
-                  )}
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
-      );
-    }
-
-    function CurrentTaskDetails() {
-      const cell = pixelMatrixCellState(currentMatrixActionKey(), currentSheetDirection() as PixelMatrixDirection);
-      const versions = [
-        ["Sheet", cell.sheet],
-        ["透明化", cell.cutout],
-        ["Runtime", cell.runtime],
-        ["Preview", cell.preview],
-        ["Video", cell.video]
-      ] as Array<[string, AssetImageVersion | undefined]>;
-      return (
-        <section className="current-task-panel" aria-label="当前任务详情">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">当前任务</div>
-              <strong>
-                {cell.actionLabel} / {cell.directionLabel}
-              </strong>
-            </div>
-            <MatrixStatusBadge cell={cell} />
-          </div>
-          {cell.stale && <p className="stale-warning">当前 runtime 来自旧 pipeline 或仍包含裁切信息，建议重新执行归一化。</p>}
-          <div className="version-strip">
-            {versions.map(([label, version]) => (
-              <button
-                className={version ? "version-pill available" : "version-pill"}
-                disabled={!version}
-                key={label}
-                onClick={() => {
-                  if (!version) return;
-                  setActivePreviewVersionId(version.id);
-                  setActivePreviewPath(version.path);
-                  setActivePreviewLabel(`${cell.actionLabel} / ${cell.directionLabel} / ${label}`);
-                }}
-                type="button"
-              >
-                <strong>{label}</strong>
-                <span>{version ? browserVersionDate(version) || version.role : "缺失"}</span>
-              </button>
-            ))}
-          </div>
-        </section>
-      );
-    }
-
-    function SyncPreviewPanel() {
-      const actionKey = currentMatrixActionKey();
-      const [syncPreviewFrame, setSyncPreviewFrame] = useState(0);
-      const [syncPreviewPlaying, setSyncPreviewPlaying] = useState(false);
-      const [syncPreviewShowGrid, setSyncPreviewShowGrid] = useState(true);
-      const [syncPreviewShowBaseline, setSyncPreviewShowBaseline] = useState(true);
-      const frameCount = Math.max(1, pixelColumns * pixelRows);
-      const frame = Math.max(0, Math.min(syncPreviewFrame, frameCount - 1));
-      const frameColumn = frame % pixelColumns;
-      const frameRow = Math.floor(frame / pixelColumns);
-      const backgroundPositionX = pixelColumns <= 1 ? "0%" : `${(frameColumn / (pixelColumns - 1)) * 100}%`;
-      const backgroundPositionY = pixelRows <= 1 ? "0%" : `${(frameRow / (pixelRows - 1)) * 100}%`;
-
-      useEffect(() => {
-        if (!syncPreviewPlaying) return undefined;
-        const timer = window.setInterval(() => {
-          setSyncPreviewFrame((current) => (current + 1) % frameCount);
-        }, 150);
-        return () => window.clearInterval(timer);
-      }, [syncPreviewPlaying, frameCount]);
-
-      return (
-        <section className="sync-preview-panel" aria-label="四方向同步预览">
-          <div className="sync-preview-toolbar">
-            <div>
-              <div className="section-kicker">同步预览</div>
-              <strong>{pixelMatrixActionLabel(actionKey)} 四方向</strong>
-            </div>
-            <div className="sync-preview-actions">
-              <button className="secondary-action icon-only" onClick={() => setSyncPreviewFrame((current) => (current - 1 + frameCount) % frameCount)} type="button" aria-label="上一帧" title="上一帧">
-                <SkipBack size={15} />
-              </button>
-              <button className="secondary-action" onClick={() => setSyncPreviewPlaying((current) => !current)} type="button">
-                <Play size={15} />
-                {syncPreviewPlaying ? "暂停" : "播放"}
-              </button>
-              <button className="secondary-action icon-only" onClick={() => setSyncPreviewFrame((current) => (current + 1) % frameCount)} type="button" aria-label="下一帧" title="下一帧">
-                <SkipForward size={15} />
-              </button>
-              <label className="mini-toggle">
-                <input checked={syncPreviewShowGrid} onChange={(event) => setSyncPreviewShowGrid(event.target.checked)} type="checkbox" />
-                格线
-              </label>
-              <label className="mini-toggle">
-                <input checked={syncPreviewShowBaseline} onChange={(event) => setSyncPreviewShowBaseline(event.target.checked)} type="checkbox" />
-                脚线
-              </label>
-            </div>
-          </div>
-          <div className="sync-preview-grid">
-            {pixelMatrixDirections.map((direction) => {
-              const cell = pixelMatrixCellState(actionKey, direction);
-              const controlled = cell.runtime;
-              const fallback = cell.preview || cell.cutout || cell.sheet;
-              return (
-                <div className="sync-preview-tile" key={direction}>
-                  <div className="sync-preview-title">
-                    <strong>{pixelDirectionLabel(direction)}</strong>
-                    <span>{controlled ? "runtime" : fallback ? "preview" : "缺失"}</span>
-                  </div>
-                  <div className={`sync-preview-frame ${syncPreviewShowGrid ? "show-grid" : ""} ${syncPreviewShowBaseline ? "show-baseline" : ""}`}>
-                    {controlled ? (
-                      <div
-                        className="sync-preview-sheet"
-                        style={{
-                          backgroundImage: `url("${previewUrlForPath(projectRoot, controlled.path)}")`,
-                          backgroundPosition: `${backgroundPositionX} ${backgroundPositionY}`,
-                          backgroundSize: `${pixelColumns * 100}% ${pixelRows * 100}%`
-                        }}
-                      />
-                    ) : fallback ? (
-                      <img src={previewUrlForPath(projectRoot, fallback.path)} alt={`${pixelDirectionLabel(direction)} 预览`} />
-                    ) : (
-                      <span>暂无产物</span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      );
-    }
-
-    return (
-      <div className="module-page pixel-compact-page">
-        <section className="form-panel">
-          {WorkerAlert()}
-          <div className="panel-heading">
-            <Layers size={18} />
-            <div>
-              <h3>像素序列帧专项生产</h3>
-              <p>按参考仓库拆成明确阶段：概念图、基准图、动作序列图、背景透明化、归一化。动作序列图阶段可选择直接生成或图生视频路径。</p>
-            </div>
-          </div>
-          {PixelGlobals()}
-          {isCharacter && !isTilemap && (
-            <>
-              <PixelMatrixWorkbench />
-              <div className="pixel-summary-grid">
-                <CurrentTaskDetails />
-                <BatchQueuePanel />
-              </div>
-              <section className="collapsible-workbench-panel">
-                <button className="collapsible-panel-trigger" onClick={() => setPixelPreviewOpen((current) => !current)} type="button">
-                  <span>
-                    <strong>同步预览</strong>
-                    <small>{pixelPreviewOpen ? "收起四方向播放面板" : "展开查看四方向播放与帧控制"}</small>
-                  </span>
-                  <ChevronDown className={pixelPreviewOpen ? "expanded" : ""} size={16} />
-                </button>
-                {pixelPreviewOpen && <SyncPreviewPanel />}
-              </section>
-            </>
-          )}
-          {AssetPreview()}
-          <div className="workflow-layout secondary-workflow">
-            {StageNav()}
-            <div className="task-detail-stack">
-              {PixelStagePanel()}
-            </div>
-          </div>
-        </section>
-      </div>
-    );
-  }
-
-  function GameUiPage() {
-    const selectedStructure = gameUiStructures.find((item) => item.path === gameUiStructurePath);
-    const selectedKit = selectedGameUiTextureKit();
-    const htmlPrototypeOptions = gameUiHtmlPrototypes.map((item) => ({
-      value: item.screenName,
-      label: item.screenName,
-      description: item.path
-    }));
-    const structureOptions = gameUiStructures.map((item) => ({
-      value: item.path,
-      label: item.screenName,
-      description: item.referenceResolution?.width ? `${item.referenceResolution.width}x${item.referenceResolution.height || 1080} · ${item.path}` : item.path
-    }));
-    const kitOptions = gameUiTextureKits.map((kit) => ({
-      value: gameUiKitSelectionValue(kit),
-      label: kit.kitName,
-      description: kit.inProgress
-        ? `进行中 · ${kit.stateSheetCount || 0} 状态图 · ${kit.generatedStateCount || 0} 状态 PNG`
-        : `${(kit.validation?.warnings?.length || 0) > 0 ? `${kit.validation?.warnings?.length} 个警告` : kit.validation?.ok === false ? "缺项" : "可用"} · ${kit.tokens.length} tokens`
-    }));
-    const kitNameOptions = gameUiTextureKits.map((kit) => ({
-      value: kit.kitName,
-      label: kit.kitName,
-      description: kit.inProgress
-        ? `进行中 · ${kit.stateSheetCount || 0} 状态图 · ${kit.generatedStateCount || 0} 状态 PNG`
-        : kit.path
-    }));
-    const conceptChoices = gameUiConceptVersionChoices();
-    const selectedConcept = uiConceptSlot();
-    const conceptOptions = conceptChoices.map(({ asset, version }) => ({
-      value: version.id,
-      label: `${asset.name} · ${browserVersionDate(version) || versionRoleLabel(version.role)}`,
-      description: version.path
-    }));
-    const selectedChromaHex = gameUiSelectedChromaHex();
-    const selectedChromaRgb = gameUiSelectedChromaRgb();
-    return (
-      <div className="module-page">
-        {AssetPreview()}
-        <section className="form-panel">
-          {WorkerAlert()}
-          <div className="panel-heading">
-            <Box size={18} />
-            <div>
-              <h3>游戏 UI 结构 / 贴图流水线</h3>
-              <p>外部 AI 通过 MCP 生成 HTML；这里负责烘焙结构、管理贴图组，并一键写入 UE。</p>
-            </div>
-          </div>
-          <div className="module-switcher" role="tablist" aria-label="游戏 UI 工作流">
-            <button className={gameUiTab === "structure" ? "active" : ""} onClick={() => setGameUiTab("structure")} type="button">
-              UI 结构
-            </button>
-            <button className={gameUiTab === "texture_kit" ? "active" : ""} onClick={() => setGameUiTab("texture_kit")} type="button">
-              UI 贴图组
-            </button>
-          </div>
-          {gameUiTab === "structure" && (
-            <>
-              <section className="subpanel">
-                <div className="section-header">
-                  <div>
-                    <div className="section-kicker">MCP / HTML</div>
-                    <strong>HTML 原型</strong>
-                  </div>
-                  <ClipboardCopy size={18} />
-                </div>
-                <p className="help-copy">
-                  把 DSL 提示词交给外部 AI；AI 应通过 MCP 写入项目目录。这里也允许粘贴 HTML 保存，便于人工修正。
-                </p>
-                <div className="two-col">
-                  <label className="field">
-                    <span>HTML 原型</span>
-                    <EditableCommandCombobox
-                      value={gameUiScreenName}
-                      onValueChange={(value) => {
-                        selectGameUiHtmlPrototype(value).catch((error) => pushLog(error.message));
-                      }}
-                      options={htmlPrototypeOptions}
-                      placeholder="选择或输入新屏幕名"
-                      emptyLabel="没有 HTML 原型"
-                    />
-                  </label>
-                  <label className="field">
-                    <span>HTML 路径</span>
-                    <input value={gameUiHtmlPath} onChange={(event) => setGameUiHtmlPath(event.target.value)} placeholder="保存后自动写入 ui/html/*.html" />
-                  </label>
-                  <label className="field span-2">
-                    <span>HTML 内容</span>
-                    <textarea
-                      className="short-textarea"
-                      value={gameUiHtmlDraft}
-                      onChange={(event) => setGameUiHtmlDraft(event.target.value)}
-                      placeholder="可选：粘贴外部 AI 生成的 HTML，然后点击保存。MCP 写入时可以留空。"
-                    />
-                  </label>
-                </div>
-                <div className="button-row wrap">
-                  <button className="secondary-action tall" onClick={copyGameUiDslPrompt} disabled={disabled} type="button">
-                    <ClipboardCopy size={15} />
-                    复制 UI DSL 提示词
-                  </button>
-                  <button className="secondary-action tall" onClick={saveGameUiHtml} disabled={disabled || !gameUiHtmlDraft.trim()} type="button">
-                    <FileJson size={15} />
-                    保存 HTML
-                  </button>
-                  <button className="secondary-action tall danger-action" onClick={deleteGameUiHtml} disabled={disabled || !gameUiHtmlPath} type="button">
-                    <Trash2 size={15} />
-                    删除 HTML
-                  </button>
-                  <button className="primary-action" onClick={bakeGameUiHtml} disabled={disabled || !gameUiScreenName.trim()} type="button">
-                    <Wand2 size={15} />
-                    烘焙结构 JSON
-                  </button>
-                </div>
-              </section>
-
-              <section className="subpanel">
-                <div className="section-header">
-                  <div>
-                    <div className="section-kicker">结构 / UMG</div>
-                    <strong>结构化 UI 描述</strong>
-                  </div>
-                  <FileJson size={18} />
-                </div>
-                <div className="two-col">
-                  <label className="field">
-                    <span>结构 JSON</span>
-                    <CommandCombobox
-                      value={gameUiStructurePath}
-                      onValueChange={setGameUiStructurePath}
-                      options={structureOptions}
-                      placeholder="选择结构 JSON"
-                      searchPlaceholder="搜索结构 JSON"
-                      emptyLabel="没有结构 JSON"
-                      allowCustom={false}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>贴图组</span>
-                    <CommandCombobox
-                      value={gameUiSelectedKitPath}
-                      onValueChange={setGameUiSelectedKitPath}
-                      options={kitOptions}
-                      placeholder="选择 UI 贴图组"
-                      searchPlaceholder="搜索 UI 贴图组"
-                      emptyLabel="没有 UI 贴图组"
-                      allowCustom={false}
-                    />
-                  </label>
-                </div>
-                <div className="runtime-list compact-list">
-                  <span>
-                    <strong>当前结构</strong>
-                    <small>{selectedStructure ? `${selectedStructure.screenName} · ${selectedStructure.referenceResolution?.width || 1920}x${selectedStructure.referenceResolution?.height || 1080}` : "未选择"}</small>
-                  </span>
-                  <span>
-                    <strong>当前贴图组</strong>
-                    <small>{selectedKit ? `${selectedKit.kitName} · ${selectedKit.tokens.length} tokens` : "未选择"}</small>
-                  </span>
-                  <span>
-                    <strong>UE 内容路径</strong>
-                    <small>{contentPath}/UI</small>
-                  </span>
-                </div>
-                <div className="button-row wrap">
-                  <button className="secondary-action tall" onClick={refreshGameUiWorkspace} disabled={disabled} type="button">
-                    <RefreshCw size={15} />
-                    刷新列表
-                  </button>
-                  <button className="secondary-action tall" onClick={openGameUiSkinPreview} disabled={disabled || !gameUiStructurePath || !selectedKit?.path} type="button">
-                    <Eye size={15} />
-                    预览应用效果
-                  </button>
-                  <button className="secondary-action tall danger-action" onClick={deleteGameUiStructure} disabled={disabled || !gameUiStructurePath} type="button">
-                    <Trash2 size={15} />
-                    删除结构 JSON
-                  </button>
-                  <button className="primary-action" onClick={exportGameUiUmg} disabled={disabled || !gameUiStructurePath || !selectedKit?.path} type="button">
-                    <Download size={15} />
-                    一键导出到 UE
-                  </button>
-                </div>
-              </section>
-            </>
-          )}
-          {gameUiTab === "texture_kit" && (
-            <>
-              <section className="subpanel">
-                <div className="section-header">
-                  <div>
-                    <div className="section-kicker">概念参考</div>
-                    <strong>UI 概念图</strong>
-                  </div>
-                  <Sparkles size={18} />
-                </div>
-                <div className="two-col">
-                  <label className="field">
-                    <span>UI 资产名</span>
-                    <input value={uiAssetName} onChange={(event) => setUiAssetName(event.target.value)} />
-                  </label>
-                  <label className="field">
-                    <span>生成方式</span>
-                    <select value={imageProvider} onChange={(event) => setImageProvider(event.target.value as ImageProvider)}>
-                      <option value="openai_api">OpenAI 密钥（gpt-image-2）</option>
-                      <option value="codex_oauth">ChatGPT 订阅账号</option>
-                    </select>
-                  </label>
-                  <label className="field span-2">
-                    <span>UI 概念图</span>
-                    <CommandCombobox
-                      value={selectedConcept?.version.id || ""}
-                      onValueChange={(value) => {
-                        selectGameUiConceptVersion(value).catch((error) => pushLog(error.message));
-                      }}
-                      options={conceptOptions}
-                      placeholder="选择 UI 概念图"
-                      searchPlaceholder="搜索 UI 概念图"
-                      emptyLabel="当前 UI 资产没有概念图"
-                      allowCustom={false}
-                    />
-                    <small className="field-hint">{selectedConcept?.version.path || "生成或导入概念图后可在这里切换版本。"}</small>
-                  </label>
-                  <label className="field span-2">
-                    <span>游戏类型与风格</span>
-                    <textarea className="short-textarea" value={uiGameDescription} onChange={(event) => setUiGameDescription(event.target.value)} />
-                  </label>
-                  <label className="field span-2">
-                    <span>界面布局</span>
-                    <textarea className="short-textarea" value={uiLayout} onChange={(event) => setUiLayout(event.target.value)} />
-                  </label>
-                </div>
-                <div className="button-row wrap">
-                  <button className="run-button" onClick={generateUiConcept} disabled={disabled}>
-                    <Wand2 size={17} />
-                    生成 UI 概念图
-                  </button>
-                  <button className="secondary-action tall" onClick={importUiConcept} disabled={disabled} type="button">
-                    <FileImage size={15} />
-                    导入 UI 概念图
-                  </button>
-                  <button className="secondary-action tall danger-action" onClick={deleteCurrentUiConcept} disabled={disabled || !selectedConcept} type="button">
-                    <Trash2 size={15} />
-                    删除概念图
-                  </button>
-                </div>
-              </section>
-
-              <section className="subpanel">
-                <div className="section-header">
-                  <div>
-                    <div className="section-kicker">贴图组</div>
-                    <strong>通用控件状态贴图</strong>
-                  </div>
-                  <Box size={18} />
-                </div>
-                <div className="runtime-list compact-list">
-                  <span>
-                    <strong>当前概念图</strong>
-                    <small>{selectedConcept?.version.path || "未选择"}</small>
-                  </span>
-                  <span>
-                    <strong>引用模式</strong>
-                    <small>{selectedConcept?.mode === "fixed" ? "固定版本" : "自动最新"}</small>
-                  </span>
-                </div>
-                <div className="asset-kind-summary">
-                  <div>
-                    <strong>{DEFAULT_GAME_UI_TEXTURE_TOKEN_COUNT}</strong>
-                    <span>默认 token</span>
-                  </div>
-                  <div>
-                    <strong>{DEFAULT_GAME_UI_TEXTURE_STATE_COUNT}</strong>
-                    <span>状态贴图</span>
-                  </div>
-                  <div>
-                    <strong>{DEFAULT_GAME_UI_TEXTURE_BATCH_COUNT}</strong>
-                    <span>本地预览页</span>
-                  </div>
-                </div>
-                <p className="field-hint">
-                  默认生成 panel、image、text、button、input、scroll、checkbox、slider、dropdown 的通用 UE 控件贴图；后端会按控件 token 合并生成同一控件的所有状态，先用 rembg/透明度定位状态区域，再拆成状态 PNG 并本地打包预览页，避免整页 atlas 错位裁切。
-                </p>
-                <div className="two-col">
-                  <label className="field">
-                    <span>贴图组名</span>
-                    <EditableCommandCombobox
-                      value={gameUiKitName}
-                      onValueChange={selectGameUiKitName}
-                      options={kitNameOptions}
-                      placeholder="选择或输入贴图组名"
-                      emptyLabel="没有贴图组"
-                    />
-                  </label>
-                  <label className="field">
-                    <span>UE 内容路径</span>
-                    <input value={contentPath} onChange={(event) => setContentPath(event.target.value)} />
-                  </label>
-                  <label className="field">
-                    <span>当前贴图组</span>
-                    <CommandCombobox
-                      value={gameUiSelectedKitPath}
-                      onValueChange={setGameUiSelectedKitPath}
-                      options={kitOptions}
-                      placeholder="选择要预览 / 清空的贴图组"
-                      searchPlaceholder="搜索当前贴图组"
-                      emptyLabel="没有贴图组"
-                      allowCustom={false}
-                    />
-                    <small className="field-hint">清空会删除该贴图组配置和项目 ui 目录下的生成文件。</small>
-                  </label>
-                  <label className="field">
-                    <span>生成并发数</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={4}
-                      step={1}
-                      value={gameUiTextureMaxConcurrency}
-                      onChange={(event) => setGameUiTextureMaxConcurrency(Math.max(1, Math.min(4, Number(event.currentTarget.value) || 1)))}
-                    />
-                    <small className="field-hint">按控件组并发生成；同一控件的不同状态仍合在一张状态图里。</small>
-                  </label>
-                  <label className="field">
-                    <span>Key Color</span>
-                    <select value={gameUiChromaPreset} onChange={(event) => setGameUiChromaPreset(event.currentTarget.value)}>
-                      {GAME_UI_CHROMA_PRESETS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                    <small className="field-hint">
-                      背景抠图色会写入 prompt、guide、抠图与验收；当前 {selectedChromaRgb ? selectedChromaHex : "格式无效"}。
-                    </small>
-                  </label>
-                  {gameUiChromaPreset === "custom" && (
-                    <label className="field">
-                      <span>自定义 HEX</span>
-                      <div className="inline-field-row">
-                        <input
-                          aria-label="自定义 Key Color"
-                          type="color"
-                          value={/^#[0-9A-F]{6}$/i.test(gameUiCustomChromaHex) ? gameUiCustomChromaHex : "#FFFFFF"}
-                          onChange={(event) => setGameUiCustomChromaHex(event.currentTarget.value.toUpperCase())}
-                        />
-                        <input value={gameUiCustomChromaHex} onChange={(event) => setGameUiCustomChromaHex(event.currentTarget.value.toUpperCase())} placeholder="#RRGGBB" />
-                      </div>
-                      <small className="field-hint">
-                        {selectedChromaHex === "#FFFFFF" ? "白色可能误删高光或浅色描边；仅在 UI 主体完全避开白色时使用。" : "自定义颜色不得出现在控件主体、高光、阴影和抗锯齿边缘。"}
-                      </small>
-                    </label>
-                  )}
-                  <label className="field checkbox-field">
-                    <span>调试输出</span>
-                    <label>
-                      <input type="checkbox" checked={gameUiTextureDebugArtifacts} onChange={(event) => setGameUiTextureDebugArtifacts(event.currentTarget.checked)} />
-                      保存生成/Mask 调试图
-                    </label>
-                  </label>
-                  <div className="field span-2">
-                    <span>高级额外 tokens JSON</span>
-                    <button className="secondary-action compact" onClick={() => setGameUiAdvancedTokensOpen((current) => !current)} type="button">
-                      {gameUiAdvancedTokensOpen ? "收起高级 JSON" : "展开高级 JSON"}
-                    </button>
-                    {gameUiAdvancedTokensOpen && (
-                      <textarea className="short-textarea" value={gameUiWidgetTokensJson} onChange={(event) => setGameUiWidgetTokensJson(event.target.value)} />
-                    )}
-                    <small className="field-hint">留空数组即可生成通用全套；这里仅用于追加项目专属 token。</small>
-                  </div>
-                  <label className="field span-2">
-                    <span>登记已有贴图 JSON</span>
-                    <textarea className="short-textarea" value={gameUiKitFilesJson} onChange={(event) => setGameUiKitFilesJson(event.target.value)} />
-                  </label>
-                </div>
-                <div className="button-row wrap">
-                  <button className="secondary-action tall" onClick={registerGameUiTextureKit} disabled={disabled || !gameUiKitName.trim()} type="button">
-                    <FileJson size={15} />
-                    登记已有贴图组
-                  </button>
-                  <button className="primary-action" onClick={generateGameUiTextureKit} disabled={disabled || !gameUiKitName.trim()} type="button">
-                    <Box size={15} />
-                    生成贴图组
-                  </button>
-                  <button className="secondary-action tall danger-action" onClick={requestClearGameUiTextureKit} disabled={disabled || !gameUiSelectedKitPath} type="button">
-                    <Trash2 size={15} />
-                    清空贴图
-                  </button>
-                </div>
-              </section>
-            </>
-          )}
-        </section>
-      </div>
-    );
-  }
-
-  function GeneratePage() {
-    return (
-      <div className="workflow-grid">
-        {AssetPreview()}
-        <section className="form-panel">
-          {WorkerAlert()}
-          <div className="panel-heading">
-            <Sparkles size={18} />
-            <div>
-              <h3>生成 Sprite / Icon</h3>
-              <p>用云端图片模型生成源图，随后写入 manifest 并进入后处理链。</p>
-            </div>
-          </div>
-          <div className="two-col">
-            <label className="field">
-              <span>资产名</span>
-              <input value={assetName} onChange={(event) => setAssetName(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>风格</span>
-              <select value={styleId} onChange={(event) => setStyleId(event.target.value)}>
-                <option value="pixel_art">像素风 2D</option>
-                <option value="hand_drawn_cartoon">手绘/卡通 2D</option>
-                <option value="semi_realistic_ui">写实/半写实 UI</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>生成方式</span>
-              <select value={imageProvider} onChange={(event) => setImageProvider(event.target.value as ImageProvider)}>
-                <option value="openai_api">OpenAI 密钥（gpt-image-2）</option>
-                <option value="codex_oauth">ChatGPT 订阅账号</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>UE 内容路径</span>
-              <input value={contentPath} onChange={(event) => setContentPath(event.target.value)} />
-            </label>
-          </div>
-          <label className="field">
-            <span>Prompt</span>
-            <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
-          </label>
-          <button className="run-button" onClick={generateSprite} disabled={disabled}>
-            <Wand2 size={17} />
-            {imageProvider === "codex_oauth" ? "用 ChatGPT 订阅生成资产" : "调用 gpt-image-2 生成资产"}
-          </button>
-        </section>
-      </div>
-    );
-  }
-
-  function ProcessPage() {
-    return (
-      <div className="workflow-grid">
-        {AssetPreview()}
-        <section className="form-panel">
-          {WorkerAlert()}
-          <div className="panel-heading">
-            <Scissors size={18} />
-            <div>
-              <h3>处理图片</h3>
-              <p>裁剪、清理 alpha、像素风放大、调色板量化，以及 rembg / SAM 分割。</p>
-            </div>
-          </div>
-          <label className="field">
-            <span>输入图片</span>
-            <input value={processInput} onChange={(event) => setProcessInput(event.target.value)} placeholder="项目内相对路径或绝对路径" />
-          </label>
-          <label className="field">
-            <span>输出图片</span>
-            <input value={processOutput} onChange={(event) => setProcessOutput(event.target.value)} placeholder="留空则自动写入资产 generated 目录" />
-          </label>
-          <div className="three-col">
-            <label className="field span-3">
-              <span>输出资产名</span>
-              <input value={processAssetName} onChange={(event) => setProcessAssetName(event.target.value)} placeholder={selectedAsset?.name || "Processed Image"} />
-            </label>
-            <label className="field">
-              <span>操作</span>
-              <select value={processOperation} onChange={(event) => setProcessOperation(event.target.value)}>
-                <option value="trim">Trim</option>
-                <option value="clean_alpha">Clean alpha</option>
-                <option value="nearest_scale">Nearest scale</option>
-                <option value="quantize_palette">Quantize</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Padding</span>
-              <input type="number" value={padding} onChange={(event) => setPadding(Number(event.target.value))} />
-            </label>
-            <label className="field">
-              <span>Scale</span>
-              <input type="number" value={scale} onChange={(event) => setScale(Number(event.target.value))} />
-            </label>
-            <label className="field">
-              <span>Colors</span>
-              <input type="number" value={colors} onChange={(event) => setColors(Number(event.target.value))} />
-            </label>
-            <label className="field span-2">
-              <span>rembg 模型</span>
-              <select value={rembgModel} onChange={(event) => setRembgModel(event.target.value)}>
-                <option value="isnet-general-use">isnet-general-use</option>
-                <option value="isnet-anime">isnet-anime</option>
-                <option value="u2netp">u2netp</option>
-              </select>
-            </label>
-          </div>
-          <div className="button-row">
-            <button className="run-button inline-run" onClick={processImage} disabled={disabled}>
-              <Scissors size={17} />
-              执行处理
-            </button>
-            <button className="secondary-action tall" onClick={removeBackground} disabled={disabled}>
-              <Eraser size={17} />
-              rembg 抠图
-            </button>
-          </div>
-          <section className="subpanel">
-            <div className="panel-heading compact-heading">
-              <Cpu size={17} />
-              <div>
-                <h3>SAM 2.1 精细分割</h3>
-                <p>用于点选、框选或多物体提取后的 mask 修正。</p>
-              </div>
-            </div>
-            <div className="two-col">
-              <label className="field">
-                <span>SAM 模型</span>
-                <select value={samModelId} onChange={(event) => setSamModelId(event.target.value)}>
-                  <option value="sam2.1_hiera_tiny">sam2.1_hiera_tiny</option>
-                  <option value="sam2.1_hiera_small">sam2.1_hiera_small</option>
-                  <option value="sam2.1_hiera_base_plus">sam2.1_hiera_base_plus</option>
-                  <option value="sam2.1_hiera_large">sam2.1_hiera_large</option>
-                </select>
-              </label>
-            <label className="field">
-              <span>输出 mask</span>
-                <input value={samMaskPath} onChange={(event) => setSamMaskPath(event.target.value)} placeholder="留空则自动写入 mask 版本" />
-              </label>
-            </div>
-            <label className="field">
-              <span>输入图片</span>
-              <input value={samImagePath} onChange={(event) => setSamImagePath(event.target.value)} placeholder="项目内相对路径或绝对路径" />
-            </label>
-            <div className="two-col">
-              <label className="field">
-                <span>点选 x,y; x,y</span>
-                <input value={samPoints} onChange={(event) => setSamPoints(event.target.value)} placeholder="128,96; 180,120" />
-              </label>
-              <label className="field">
-                <span>点标签</span>
-                <input value={samLabels} onChange={(event) => setSamLabels(event.target.value)} placeholder="1,0" />
-              </label>
-              <label className="field span-2">
-                <span>框选 x1,y1,x2,y2</span>
-                <input value={samBox} onChange={(event) => setSamBox(event.target.value)} placeholder="32,24,220,180" />
-              </label>
-            </div>
-            <button className="secondary-action tall" onClick={segmentWithSam} disabled={disabled}>
-              <Cpu size={17} />
-              运行 SAM 分割
-            </button>
-          </section>
-        </section>
-      </div>
-    );
-  }
-
-  function SpritesheetPage() {
-    return (
-      <div className="workflow-grid">
-        {AssetPreview()}
-        <section className="form-panel">
-          {WorkerAlert()}
-          <div className="panel-heading">
-            <Layers size={18} />
-            <div>
-              <h3>序列图切图</h3>
-              <p>先做固定网格切分，写出帧矩形、pivot 和 Unreal 目标说明。</p>
-            </div>
-          </div>
-          <label className="field">
-            <span>序列图图片</span>
-            <input value={sheetPath} onChange={(event) => setSheetPath(event.target.value)} />
-          </label>
-          <div className="three-col">
-            <label className="field span-3">
-              <span>资产名</span>
-              <input value={sheetName} onChange={(event) => setSheetName(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>帧宽</span>
-              <input type="number" value={cellWidth} onChange={(event) => setCellWidth(Number(event.target.value))} />
-            </label>
-            <label className="field">
-              <span>帧高</span>
-              <input type="number" value={cellHeight} onChange={(event) => setCellHeight(Number(event.target.value))} />
-            </label>
-            <label className="field">
-              <span>UE 内容路径</span>
-              <input value={contentPath} onChange={(event) => setContentPath(event.target.value)} />
-            </label>
-          </div>
-          <button className="run-button" onClick={createSpritesheetManifest} disabled={disabled}>
-            <Layers size={17} />
-            切图并写入资产清单
-          </button>
-        </section>
-      </div>
-    );
-  }
-
-  function UIKitPage() {
-    return (
-      <div className="workflow-grid">
-        {AssetPreview()}
-        <section className="form-panel">
-          {WorkerAlert()}
-          <div className="panel-heading">
-            <Box size={18} />
-            <div>
-              <h3>UI Kit 状态资产</h3>
-              <p>管理按钮状态图、面板图和九宫格数据，并写出 Unreal UI 资产清单。</p>
-            </div>
-          </div>
-          <div className="two-col">
-            <label className="field">
-              <span>UI 资产名</span>
-              <input value={uiName} onChange={(event) => setUiName(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>九宫格</span>
-              <input value={nineSlice} onChange={(event) => setNineSlice(event.target.value)} />
-            </label>
-          </div>
-          <div className="two-col">
-            <label className="field">
-              <span>正常</span>
-              <input value={uiNormal} onChange={(event) => setUiNormal(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>悬停</span>
-              <input value={uiHover} onChange={(event) => setUiHover(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>按下</span>
-              <input value={uiPressed} onChange={(event) => setUiPressed(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>禁用</span>
-              <input value={uiDisabled} onChange={(event) => setUiDisabled(event.target.value)} />
-            </label>
-          </div>
-          <button className="run-button" onClick={createUiManifest} disabled={disabled}>
-            <Box size={17} />
-            生成 UI 资产清单
-          </button>
-        </section>
-      </div>
-    );
-  }
-
-  function AssetsPage() {
-    return (
-      <div className="detail-grid">
-        <section className="detail-card">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">当前资产</div>
-              <strong>{selectedAsset?.name || "未选择资产"}</strong>
-            </div>
-            <FileImage size={20} />
-          </div>
-          {AssetPreview()}
-        </section>
-
-        <section className="detail-card">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">资产清单 / 质量</div>
-              <strong>{issueCount} 个问题</strong>
-            </div>
-            <button className="icon-action" onClick={validateCurrentManifest} disabled={disabled || !currentManifest} aria-label="校验资产清单">
-              <CheckCircle2 size={16} />
-            </button>
-          </div>
-          {validationResult && (
-            <div className="issue-list">
-              {validationResult.errors.map((item) => (
-                <span key={item}>
-                  <b>结构</b>
-                  {item}
-                </span>
-              ))}
-              {validationResult.issues.map((item, index) => (
-                <span key={`${item.code}-${index}`}>
-                  <b>{item.severity || "问题"}</b>
-                  {item.message || item.code}
-                </span>
-              ))}
-              {issueCount === 0 && (
-                <span>
-                  <b>通过</b>
-                  当前资产清单未发现问题。
-                </span>
-              )}
-            </div>
-          )}
-          <textarea className="json-view" readOnly value={JSON.stringify(lastResult || currentManifest || {}, null, 2)} />
-        </section>
-      </div>
-    );
-  }
-
-  function ModelsPage() {
-    return (
-      <section className="full-page-card">
-        <div className="section-header">
-          <div>
-            <div className="section-kicker">本地模型</div>
-            <strong>{installedCount} / {models.length} 已安装</strong>
-          </div>
-          <button className="secondary-action tall" onClick={() => runAction("刷新模型", refreshModels, undefined, { notify: false })} disabled={disabled}>
-            <RefreshCw size={15} />
-            刷新
-          </button>
-        </div>
-        <small className="path-hint">{modelCacheDir || runtimeSettings?.modelCacheDir || "model-cache"}</small>
-        <div className="dependency-grid">
-          {(modelDependencies || []).map((dependency) => (
-            <span className={`dependency-pill ${dependency.available ? "ok" : "missing"}`} key={dependency.id}>
-              <strong>{dependency.label}</strong>
-              <small>{dependency.detail}</small>
-            </span>
-          ))}
-        </div>
-        <div className="model-grid">
-          {models.length === 0 ? (
-            <div className="empty-card">模型注册表为空。请先确认本地服务可用，然后刷新模型。</div>
-          ) : (
-            models.map((model) => (
-              <article className="model-card" key={model.id}>
-                <div className="section-header">
-                  <div>
-                    <strong>{model.display_name}</strong>
-                    <small>{model.provider} · {model.task} · {model.version} · {model.recommended_vram_gb}GB · {model.size_hint}</small>
-                  </div>
-                  <span className={`pill ${model.status}`}>{modelStatusLabel(model.status)}</span>
-                </div>
-                <div className="model-meta">
-                  <span>
-                    <b>许可</b>
-                    {model.license}
-                  </span>
-                  <span>
-                    <b>本地路径</b>
-                    {model.local_path || "-"}
-                  </span>
-                  <span>
-                    <b>校验值</b>
-                    {model.checksum || "未锁定"}
-                  </span>
-                  <span>
-                    <b>来源</b>
-                    {model.source}
-                  </span>
-                </div>
-                <div className="button-row">
-                  {model.id.startsWith("sam2.1") ? (
-                    <button className="secondary-action" onClick={() => downloadSam(model.id)} disabled={disabled}>
-                      <Download size={14} />
-                      下载
-                    </button>
-                  ) : (
-                    <button className="secondary-action" onClick={() => installMarker(model.id)} disabled={disabled}>
-                      <Download size={14} />
-                      登记
-                    </button>
-                  )}
-                  <button className="secondary-action danger-action" onClick={() => deleteModel(model.id)} disabled={disabled}>
-                    <Trash2 size={14} />
-                    删除
-                  </button>
-                </div>
-              </article>
-            ))
-          )}
-        </div>
-      </section>
-    );
-  }
-
-  function ExportPage() {
-    return (
-      <div className="detail-grid">
-        <section className="detail-card">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">Unreal 连接</div>
-              <strong>{unrealStatus?.mode || "未检测"}</strong>
-            </div>
-            <button className="icon-action" onClick={checkUnrealStatus} disabled={disabled} aria-label="检测 Unreal MCP">
-              <RefreshCw size={16} />
-            </button>
-          </div>
-          <div className="runtime-list">
-            <span>
-              <strong>MCP</strong>
-              <small>{unrealStatus?.detail || "尚未检测"}</small>
-            </span>
-            <span>
-              <strong>UE 内容路径</strong>
-              <small>{contentPath}</small>
-            </span>
-            <span>
-              <strong>兜底输出</strong>
-              <small>{projectRoot}/exports/unreal</small>
-            </span>
-          </div>
-          <div className="button-row">
-            <button className="secondary-action tall" onClick={validateCurrentManifest} disabled={disabled || !currentManifest}>
-              <CheckCircle2 size={15} />
-              校验资产清单
-            </button>
-            <button className="primary-action" onClick={exportUnrealScript} disabled={disabled || !currentManifest}>
-              <FileJson size={15} />
-              生成 Python 脚本
-            </button>
-          </div>
-        </section>
-
-        <section className="detail-card">
-          <div className="section-kicker">导出源数据</div>
-          <textarea className="json-view" readOnly value={JSON.stringify(currentManifest || {}, null, 2)} />
-        </section>
-      </div>
-    );
-  }
-
-  function SettingsPage() {
-    return (
-      <div className="settings-grid">
-        <section className="detail-card">
-          <div className="section-kicker">运行设置</div>
-          <label className="field">
-            <span>OpenAI 密钥</span>
-            <input
-              type="password"
-              value={openAiKeyDraft}
-              onChange={(event) => setOpenAiKeyDraft(event.target.value)}
-              placeholder={runtimeSettings?.hasOpenAiApiKey ? "已配置，留空则不覆盖" : "未配置"}
-            />
-          </label>
-          <label className="field">
-            <span>OpenAI Base URL</span>
-            <input
-              value={openAiBaseUrlDraft}
-              onChange={(event) => setOpenAiBaseUrlDraft(event.target.value)}
-              placeholder="https://api.openai.com/v1"
-            />
-          </label>
-          <label className="field">
-            <span>Unreal MCP 地址</span>
-            <input value={unrealMcpUrlDraft} onChange={(event) => setUnrealMcpUrlDraft(event.target.value)} placeholder="http://127.0.0.1:xxxx" />
-          </label>
-          <label className="field">
-            <span>Hugging Face 令牌 / RMBG 2.0</span>
-            <input
-              type="password"
-              value={huggingFaceTokenDraft}
-              onChange={(event) => setHuggingFaceTokenDraft(event.target.value)}
-              placeholder={runtimeSettings?.hasHuggingFaceToken ? "已配置，留空则不覆盖" : "可选"}
-            />
-          </label>
-          <label className="field">
-            <span>Seedance 密钥</span>
-            <input
-              type="password"
-              value={seedanceKeyDraft}
-              onChange={(event) => setSeedanceKeyDraft(event.target.value)}
-              placeholder={runtimeSettings?.hasSeedanceApiKey ? "已配置，留空则不覆盖" : "角色图生视频动作可选"}
-            />
-          </label>
-          <label className="field">
-            <span>Seedance 接口地址</span>
-            <input
-              value={seedanceEndpointDraft}
-              onChange={(event) => setSeedanceEndpointDraft(event.target.value)}
-              placeholder={DEFAULT_SEEDANCE_ENDPOINT}
-            />
-          </label>
-          <div className="field">
-            <span>默认 Seedance 模型</span>
-            <CommandCombobox
-              value={seedanceModelDraft}
-              onValueChange={updateSeedanceModelDraft}
-              options={SEEDANCE_MODEL_OPTIONS}
-              placeholder={DEFAULT_SEEDANCE_MODEL}
-              searchPlaceholder="搜索 Seedance 模型"
-            />
-          </div>
-          <div className="field">
-            <span>默认 Seedance 分辨率</span>
-            <CommandCombobox
-              value={seedanceResolutionDraft}
-              onValueChange={setSeedanceResolutionDraft}
-              options={seedanceResolutionOptions().map((resolution) => ({ value: resolution, label: resolution }))}
-              placeholder={seedanceResolutionOptions()[0] || DEFAULT_SEEDANCE_RESOLUTION}
-              searchPlaceholder="搜索或输入分辨率"
-            />
-          </div>
-          <label className="field">
-            <span>网络代理</span>
-            <input
-              value={networkProxyDraft}
-              onChange={(event) => setNetworkProxyDraft(event.target.value)}
-              placeholder="例如 http://127.0.0.1:7890，留空则不使用"
-            />
-          </label>
-          <p className="help-copy">
-            默认 Seedance 模型会作为新工作区生成参数的默认值；像素工作区仍可为本次生成单独覆盖模型和分辨率。代理只用于后端访问 OpenAI / Hugging Face 等外部服务；localhost 和 127.0.0.1 会直连。
-          </p>
-          {networkCheck && (
-            <div className={`network-check ${networkCheck.reachable ? "ok" : "bad"}`}>
-              <strong>{networkCheck.reachable ? "网络可达" : "网络不可达"}</strong>
-              <small>{networkCheck.detail}</small>
-              <small>代理：{networkCheck.proxy || "未配置"} · 状态：{networkCheck.status || "-"}</small>
-            </div>
-          )}
-          <div className="button-row wrap">
-            <button className="primary-action" onClick={saveRuntimeSettings} disabled={disabled}>
-              <Settings size={15} />
-              应用设置
-            </button>
-            <button className="secondary-action tall" onClick={checkNetworkProxy} disabled={disabled}>
-              <RefreshCw size={15} />
-              测试网络
-            </button>
-          </div>
-        </section>
-
-        <section className="detail-card">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">Pixel MCP</div>
-              <strong>外部 AI stdio 配置</strong>
-            </div>
-            <ClipboardCopy size={18} />
-          </div>
-          <p className="help-copy">
-            复制后粘贴到支持 MCP 的客户端配置中。配置使用当前运行环境的绝对路径：开发态指向项目目录，打包态指向安装目录 resources；不开放 HTTP 端口。
-          </p>
-          <label className="field">
-            <span>MCP Server</span>
-            <input readOnly value="unreal-image-maker-pixel" />
-          </label>
-          <label className="field">
-            <span>启动模块</span>
-            <input readOnly value="python -m uim_core.mcp_server" />
-          </label>
-          <div className="runtime-list compact-list">
-            <span>
-              <strong>Python</strong>
-              <small>{absoluteMcpRoot() ? pixelMcpPythonPath() : "等待运行路径加载"}</small>
-            </span>
-            <span>
-              <strong>Backend</strong>
-              <small>{absoluteMcpRoot() ? pixelMcpBackendPath() : "等待运行路径加载"}</small>
-            </span>
-            <span>
-              <strong>状态</strong>
-              <small>{mcpRuntimePaths ? (mcpRuntimePaths.available ? "可用" : "未检测到完整运行时") : "浏览器预览会使用开发目录回退"}</small>
-            </span>
-          </div>
-          <button className="secondary-action tall" onClick={copyPixelMcpConfig} disabled={disabled || !absoluteMcpRoot()} type="button">
-            <ClipboardCopy size={15} />
-            复制 MCP 配置
-          </button>
-        </section>
-
-        <section className="detail-card">
-          <div className="section-header">
-            <div>
-              <div className="section-kicker">ChatGPT 订阅绑定</div>
-              <strong>{codexOAuth?.configured ? "已绑定 ChatGPT 订阅" : "未绑定"}</strong>
-            </div>
-            <span className={`pill ${codexOAuth?.configured ? "installed" : "not_installed"}`}>{codexOAuth?.configured ? "已就绪" : "待绑定"}</span>
-          </div>
-          <p className="help-copy">
-            点击开始绑定后会打开浏览器授权。默认使用 localhost:1455 自动回调；如果该端口被占用，可以把浏览器最终跳转的完整网址粘贴到下面完成绑定。
-          </p>
-          {codexFlow && (
-            <div className="oauth-fallback">
-              <p className="oauth-pending">{codexFlow.message || "正在等待浏览器授权完成..."}</p>
-              <label className="field">
-                <span>回调网址兜底输入</span>
-                <textarea
-                  className="short-textarea"
-                  value={codexCallbackInput}
-                  onChange={(event) => setCodexCallbackInput(event.target.value)}
-                  placeholder="http://localhost:1455/auth/callback?code=...&state=..."
-                />
-              </label>
-              <button className="secondary-action tall" onClick={completeCodexOAuthManually} disabled={disabled || !codexCallbackInput.trim()}>
-                <CheckCircle2 size={15} />
-                使用回调网址完成绑定
-              </button>
-            </div>
-          )}
-          <div className="runtime-list compact-list">
-            <span>
-              <strong>账号</strong>
-              <small>{codexOAuth?.email || codexOAuth?.accountId || "-"}</small>
-            </span>
-            <span>
-              <strong>过期时间</strong>
-              <small>{codexOAuth?.expiresAt || "-"}</small>
-            </span>
-            <span>
-              <strong>凭据文件</strong>
-              <small>{codexOAuth?.storePath || "-"}</small>
-            </span>
-          </div>
-          <div className="button-row wrap">
-            <button className="secondary-action tall" onClick={startCodexOAuth} disabled={disabled || Boolean(codexFlow)}>
-              <ExternalLink size={15} />
-              {codexFlow ? "等待授权" : "开始绑定"}
-            </button>
-            <button className="secondary-action tall" onClick={refreshCodexOAuth} disabled={disabled || !codexOAuth?.hasRefreshToken}>
-              <RefreshCw size={15} />
-              刷新凭据
-            </button>
-            <button className="secondary-action tall danger-action" onClick={disconnectCodexOAuth} disabled={disabled || !codexOAuth?.configured}>
-              <Trash2 size={15} />
-              断开
-            </button>
-          </div>
-        </section>
-      </div>
-    );
-  }
-
   function PageTitle() {
     const active = tabs.find((tab) => tab.id === mainTab);
     const titleMap: Record<MainTab, string> = {
@@ -7682,12 +5285,12 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
   }
 
   function MainPage() {
-    if (mainTab === "pixel") return PixelSpritesheetPage();
-    if (mainTab === "game_ui") return GameUiPage();
-    if (mainTab === "assets") return AssetsPage();
-    if (mainTab === "export") return ExportPage();
-    if (mainTab === "models") return ModelsPage();
-    return SettingsPage();
+    if (mainTab === "pixel") return <PixelPage />;
+    if (mainTab === "game_ui") return <GameUiPage />;
+    if (mainTab === "assets") return <AssetsPage />;
+    if (mainTab === "export") return <ExportPage />;
+    if (mainTab === "models") return <ModelsPage />;
+    return <SettingsPage />;
   }
 
   function gameUiNodeHasCanvasLayout(node: GameUiPreviewNode) {
@@ -7850,98 +5453,6 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     );
   }
 
-  function GameUiSkinPreviewDialog() {
-    const structure = gameUiPreviewData?.structure;
-    const root = structure?.root;
-    const refWidth = Math.max(1, structure?.referenceResolution?.width || root?.width || 1920);
-    const refHeight = Math.max(1, structure?.referenceResolution?.height || root?.height || 1080);
-    const nodes = flattenGameUiPreviewNodes(root, refWidth, refHeight);
-    const previewScale = Math.max(0.05, gameUiPreviewCanvasWidth > 0 ? gameUiPreviewCanvasWidth / refWidth : Math.min(1, 760 / refWidth));
-    const screenName = structure?.screenName || selectedStructureNameFromPath(gameUiPreviewData?.structurePath || gameUiStructurePath);
-    const kitName = gameUiPreviewData?.textureKit.kitName || selectedKitNameFromPath(gameUiPreviewData?.textureKitPath || gameUiSelectedKitPath);
-
-    return (
-      <AlertDialog.Root open={gameUiPreviewOpen} onOpenChange={setGameUiPreviewOpen}>
-        <AlertDialog.Portal>
-          <AlertDialog.Overlay className="alert-dialog-overlay" />
-          <AlertDialog.Content className="alert-dialog-content game-ui-preview-dialog">
-            <AlertDialog.Title className="alert-dialog-title">UI 贴图应用预览</AlertDialog.Title>
-            <AlertDialog.Description className="alert-dialog-description">
-              按当前结构 JSON 的坐标和 style token，套用已选择的 UI 贴图组；正式导出 UMG 时会使用同一组输入。
-            </AlertDialog.Description>
-            <div className="game-ui-preview-meta">
-              <span>
-                <strong>{screenName || "未命名屏幕"}</strong>
-                <small>{refWidth}x{refHeight}</small>
-              </span>
-              <span>
-                <strong>{kitName || "未命名贴图组"}</strong>
-                <small>{nodes.length} nodes</small>
-              </span>
-            </div>
-            {gameUiPreviewLoading ? (
-              <div className="game-ui-preview-empty">正在加载预览数据...</div>
-            ) : root ? (
-              <div className="game-ui-preview-viewport">
-                <div
-                  ref={gameUiPreviewCanvasRef}
-                  className="game-ui-preview-canvas"
-                  style={{
-                    aspectRatio: `${refWidth} / ${refHeight}`,
-                    backgroundColor: gameUiColorOrFallback(root.color, "#171d26")
-                  }}
-                >
-                  {nodes.map((node, index) => renderGameUiPreviewNode(node, refWidth, refHeight, previewScale, index))}
-                </div>
-              </div>
-            ) : (
-              <div className="game-ui-preview-empty">没有可预览的结构数据。</div>
-            )}
-            <div className="alert-dialog-actions">
-              <AlertDialog.Cancel className="dialog-button secondary">关闭</AlertDialog.Cancel>
-              <AlertDialog.Action className="dialog-button" onClick={exportGameUiUmg} disabled={!gameUiStructurePath || !gameUiSelectedKitPath}>
-                一键导出到 UE
-              </AlertDialog.Action>
-            </div>
-          </AlertDialog.Content>
-        </AlertDialog.Portal>
-      </AlertDialog.Root>
-    );
-  }
-
-  function GameUiClearTextureKitDialog() {
-    if (!gameUiClearTextureKitTarget) return null;
-
-    const target = gameUiClearTextureKitTarget;
-    const confirmClear = () => {
-      setGameUiClearTextureKitTarget(null);
-      clearGameUiTextureKit(target).catch((error) => pushLog(error.message));
-    };
-
-    return (
-      <AlertDialog.Root open={Boolean(gameUiClearTextureKitTarget)} onOpenChange={(open) => !open && setGameUiClearTextureKitTarget(null)}>
-        <AlertDialog.Portal>
-          <AlertDialog.Overlay className="alert-dialog-overlay" />
-          <AlertDialog.Content className="alert-dialog-content">
-            <div className="alert-dialog-icon" aria-hidden="true">
-              <Trash2 size={20} />
-            </div>
-            <AlertDialog.Title className="alert-dialog-title">清空 UI 贴图组</AlertDialog.Title>
-            <AlertDialog.Description className="alert-dialog-description">
-              确定要清空“{target.kitName}”吗？这会删除该贴图组配置，并删除项目 ui 目录下由它引用或生成的贴图文件、状态图和调试工作目录。
-            </AlertDialog.Description>
-            <div className="alert-dialog-actions">
-              <AlertDialog.Cancel className="dialog-button secondary">取消</AlertDialog.Cancel>
-              <AlertDialog.Action className="dialog-button danger" onClick={confirmClear}>
-                清空贴图
-              </AlertDialog.Action>
-            </div>
-          </AlertDialog.Content>
-        </AlertDialog.Portal>
-      </AlertDialog.Root>
-    );
-  }
-
   function selectedStructureNameFromPath(path: string) {
     return gameUiStructures.find((item) => item.path === path)?.screenName || path.split(/[\\/]/).pop()?.replace(/\.uim-ui\.json$/i, "");
   }
@@ -7950,375 +5461,422 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     return gameUiTextureKits.find((item) => item.path === path)?.kitName || path.split(/[\\/]/).pop()?.replace(/\.uim-uikit\.json$/i, "");
   }
 
-  function DeleteConfirmDialog() {
-    if (pendingDelete === null) return null;
-
-    const title = pendingDelete?.kind === "asset" ? "删除资产" : "删除版本";
-    const targetName =
-      pendingDelete?.kind === "asset"
-        ? pendingDelete.asset.name
-        : pendingDelete?.kind === "version"
-          ? versionDisplayLabel(pendingDelete.version)
-          : "";
-    const description =
-      pendingDelete?.kind === "asset"
-        ? "这会删除当前 .uim 项目中的资产目录及其所有版本图片。"
-        : "这会从当前资产中移除该版本；如果图片位于当前 .uim 项目内，也会同时删除图片文件。";
-    const confirmDelete = () => {
-      const target = pendingDelete;
-      setPendingDelete(null);
-      if (!target) return;
-      if (target.kind === "asset") {
-        deleteAssetFromTree(target.asset).catch((error) => pushLog(error.message));
-      } else {
-        deleteAssetVersion(target.version).catch((error) => pushLog(error.message));
-      }
-    };
-
-    return (
-      <AlertDialog.Root open={pendingDelete !== null} onOpenChange={(open) => !open && setPendingDelete(null)}>
-        <AlertDialog.Portal>
-          <AlertDialog.Overlay className="alert-dialog-overlay" />
-          <AlertDialog.Content className="alert-dialog-content">
-            <div className="alert-dialog-icon" aria-hidden="true">
-              <Trash2 size={20} />
-            </div>
-            <AlertDialog.Title className="alert-dialog-title">{title}</AlertDialog.Title>
-            <AlertDialog.Description className="alert-dialog-description">
-              确定要删除“{targetName}”吗？{description}
-            </AlertDialog.Description>
-            <div className="alert-dialog-actions">
-              <AlertDialog.Cancel className="dialog-button secondary">取消</AlertDialog.Cancel>
-              <AlertDialog.Action className="dialog-button danger" onClick={confirmDelete}>
-                删除
-              </AlertDialog.Action>
-            </div>
-          </AlertDialog.Content>
-        </AlertDialog.Portal>
-      </AlertDialog.Root>
-    );
-  }
-
-  function VideoFramePickerDialog() {
-    if (!videoFramePickerOpen) return null;
-
-    const source = currentVideoSourcePath();
-    const sourceUrl = source ? previewUrlForPath(projectRoot, source) : "";
-    const rangeDuration = Math.max(0, videoPickerDuration);
-    const rangeStart = Math.min(videoRangeStart, videoRangeEnd || rangeDuration);
-    const rangeEnd = Math.max(videoRangeStart, videoRangeEnd || rangeDuration);
-    const rangeStartPercent = rangeDuration > 0 ? (clampVideoPickerTime(rangeStart, rangeDuration) / rangeDuration) * 100 : 0;
-    const rangeEndPercent = rangeDuration > 0 ? (clampVideoPickerTime(rangeEnd, rangeDuration) / rangeDuration) * 100 : 100;
-    const selectedQueueCount = videoFrameSelections.filter((selection) => selection.selected).length;
-    const loopCandidates = videoFrameSelections.filter((selection) => selection.loopHint);
-    const loopFrame = videoFrameSelections.find((selection) => selection.loopHint && selection.id === selectedLoopFrameId) || loopCandidates[0];
-    const queueReady = videoFrameSelections.length > 0;
-    const queueLayout = videoSheetLayoutForFrameCount(videoFrameSelections.length);
-    const previewFrame = videoSelectionPreviewIndex !== null ? videoFrameSelections[videoSelectionPreviewIndex] : null;
-    const previewFrameActive = Boolean((videoSelectionPreviewing || videoLoopPreviewing) && previewFrame?.thumbnail);
-    const previewSequenceLength = videoLoopPreviewing ? Math.max(1, selectedLoopFrameIndex(videoFrameSelections)) : Math.max(1, videoFrameSelections.length);
-    const previewSequencePosition = previewFrameActive && videoSelectionPreviewIndex !== null ? Math.min(videoSelectionPreviewIndex + 1, previewSequenceLength) : 0;
-    const previewProgressPercent = previewFrameActive ? Math.max(0, Math.min(100, (previewSequencePosition / previewSequenceLength) * 100)) : 0;
-    const previewPadding = 32;
-    const previewAvailableWidth = Math.max(1, videoPreviewStageSize.width - previewPadding);
-    const previewAvailableHeight = Math.max(1, videoPreviewStageSize.height - previewPadding);
-    const previewScale =
-      videoPreviewNaturalSize.width > 0 && videoPreviewNaturalSize.height > 0
-        ? Math.min(previewAvailableWidth / videoPreviewNaturalSize.width, previewAvailableHeight / videoPreviewNaturalSize.height)
-        : 1;
-    const previewImageStyle =
-      videoPreviewNaturalSize.width > 0 && videoPreviewNaturalSize.height > 0
-        ? {
-            width: `${Math.max(1, Math.floor(videoPreviewNaturalSize.width * previewScale))}px`,
-            height: `${Math.max(1, Math.floor(videoPreviewNaturalSize.height * previewScale))}px`
-          }
-        : undefined;
-
-    return (
-      <AlertDialog.Root open={videoFramePickerOpen} onOpenChange={setVideoFramePickerOpen}>
-        <AlertDialog.Portal>
-          <AlertDialog.Overlay className="alert-dialog-overlay" />
-          <AlertDialog.Content className="alert-dialog-content frame-picker-dialog">
-            <AlertDialog.Title className="alert-dialog-title">选择视频帧</AlertDialog.Title>
-            <AlertDialog.Description className="alert-dialog-description">
-              从当前动作视频中管理一组帧；正式生成会按当前队列顺序自动计算行列并打包。
-            </AlertDialog.Description>
-            <div className="frame-picker-body">
-              <div className="frame-picker-video-panel">
-                {sourceUrl ? (
-                  <div className="frame-picker-video-wrap" style={{ aspectRatio: videoSourceAspectRatio }}>
-                    <video
-                      className="frame-picker-video"
-                      controls
-                      crossOrigin="anonymous"
-                      onLoadedMetadata={(event) => {
-                        const sourceWidth = event.currentTarget.videoWidth || 0;
-                        const sourceHeight = event.currentTarget.videoHeight || 0;
-                        setVideoSourceAspectRatio(sourceWidth > 0 && sourceHeight > 0 ? `${sourceWidth} / ${sourceHeight}` : "1 / 1");
-                        const duration = event.currentTarget.duration || 0;
-                        setVideoPickerDuration(duration);
-                        setVideoPickerCurrentTime(event.currentTarget.currentTime || 0);
-                        setVideoRangeStart((current) => clampVideoPickerTime(current, duration));
-                        setVideoRangeEnd((current) => (current > 0 ? clampVideoPickerTime(current, duration) : duration));
-                        const timesNeedingThumbnails = videoFrameSelections.filter((selection) => !selection.thumbnail).map((selection) => selection.time);
-                        if (timesNeedingThumbnails.length > 0) {
-                          hydrateVideoFrameSelectionThumbnails(timesNeedingThumbnails).catch(() => undefined);
-                        }
-                      }}
-                      onPlay={clearVideoSelectionPreview}
-                      onTimeUpdate={(event) => setVideoPickerCurrentTime(event.currentTarget.currentTime || 0)}
-                      ref={videoFramePickerRef}
-                      src={sourceUrl}
-                    />
-                    {previewFrameActive ? (
-                      <div className="frame-picker-preview-overlay">
-                        <div className="frame-picker-preview-stage" ref={videoPreviewStageRef}>
-                          <img
-                            alt="当前选帧预览"
-                            onLoad={(event) =>
-                              setVideoPreviewNaturalSize({
-                                width: event.currentTarget.naturalWidth,
-                                height: event.currentTarget.naturalHeight
-                              })
-                            }
-                            src={previewFrame?.thumbnail}
-                            style={previewImageStyle}
-                          />
-                        </div>
-                        <div className="frame-picker-playback-status">
-                          <span>
-                            #{(videoSelectionPreviewIndex ?? 0) + 1} / {previewSequenceLength} · {formatVideoTime(previewFrame?.time ?? 0)}
-                          </span>
-                          <div className="frame-picker-playback-track" aria-hidden="true">
-                            <div style={{ width: `${previewProgressPercent}%` }} />
-                          </div>
-                        </div>
-                      </div>
-                    ) : null}
-                  </div>
-                ) : (
-                  <div className="preview-object">
-                    <strong>没有视频源</strong>
-                    <span>先生成动作视频或填写视频路径。</span>
-                  </div>
-                )}
-                <div className="video-range-control">
-                  <div className="video-range-meta">
-                    <span>取帧区间</span>
-                    <b>{formatVideoTime(rangeStart)} - {formatVideoTime(rangeEnd)}</b>
-                  </div>
-                  <div className="video-range-track-wrap">
-                    <div className="video-range-track" />
-                    <div
-                      className="video-range-fill"
-                      style={{ left: `${rangeStartPercent}%`, width: `${Math.max(0, rangeEndPercent - rangeStartPercent)}%` }}
-                    />
-                    <input
-                      aria-label="取帧区间起点"
-                      className="video-range-input video-range-input-start"
-                      disabled={!sourceUrl || rangeDuration <= 0}
-                      max={rangeDuration || 0}
-                      min={0}
-                      onChange={(event) => updateVideoRangeStart(Number(event.currentTarget.value))}
-                      step={0.001}
-                      type="range"
-                      value={clampVideoPickerTime(rangeStart, rangeDuration)}
-                    />
-                    <input
-                      aria-label="取帧区间终点"
-                      className="video-range-input video-range-input-end"
-                      disabled={!sourceUrl || rangeDuration <= 0}
-                      max={rangeDuration || 0}
-                      min={0}
-                      onChange={(event) => updateVideoRangeEnd(Number(event.currentTarget.value))}
-                      step={0.001}
-                      type="range"
-                      value={clampVideoPickerTime(rangeEnd, rangeDuration)}
-                    />
-                  </div>
-                </div>
-                <div className="frame-picker-controls">
-                  <span>{formatVideoTime(videoPickerCurrentTime)} / {formatVideoTime(videoPickerDuration)}</span>
-                  <button className="secondary-action icon-action" onClick={() => stepVideoFrame(-1)} disabled={!sourceUrl} title="前一帧" type="button">
-                    <SkipBack size={15} />
-                  </button>
-                  <button className="secondary-action icon-action" onClick={() => stepVideoFrame(1)} disabled={!sourceUrl} title="后一帧" type="button">
-                    <SkipForward size={15} />
-                  </button>
-                  <button className="secondary-action" onClick={addCurrentVideoFrame} disabled={!sourceUrl} type="button">
-                    加入当前帧
-                  </button>
-                  <label className="frame-fps-field">
-                    <span>FPS</span>
-                    <input
-                      max={60}
-                      min={1}
-                      onChange={(event) => setVideoAutoFps(Math.max(1, Math.min(60, Number(event.currentTarget.value) || 1)))}
-                      type="number"
-                      value={videoAutoFps}
-                    />
-                  </label>
-                  <button className="secondary-action" onClick={() => autoSelectVideoFramesByFps().catch((error) => pushLog(error.message))} disabled={!sourceUrl || !videoPickerDuration || videoFrameThumbnailsLoading} type="button">
-                    {videoFrameThumbnailsLoading ? "取帧中" : "按 FPS 取帧"}
-                  </button>
-                  <button className="secondary-action" onClick={playVideoSelectionPreview} disabled={!sourceUrl || videoFrameSelections.length === 0} type="button">
-                    <Play size={15} />
-                    {videoSelectionPreviewing ? "停止所有帧" : "播放所有帧"}
-                  </button>
-                  <button className="secondary-action" onClick={playVideoLoopPreview} disabled={!sourceUrl || !loopFrame} type="button">
-                    <Play size={15} />
-                    {videoLoopPreviewing ? "停止循环段" : "播放至循环帧"}
-                  </button>
-                  <button
-                    className="secondary-action"
-                    onClick={() => {
-                      clearVideoSelectionPreview();
-                      setSelectedLoopFrameId(null);
-                      setVideoFrameSelections([]);
-                    }}
-                    disabled={videoFrameSelections.length === 0}
-                    type="button"
-                  >
-                    清空
-                  </button>
-                </div>
-              </div>
-              <div className="frame-queue-panel">
-                <div className="frame-queue-header">
-                  <div>
-                    <strong>帧队列</strong>
-                    <span>
-                      {videoFrameSelections.length} 帧{videoFrameSelections.length > 0 ? `，生成 ${queueLayout.columns}x${queueLayout.rows}` : ""}
-                      {selectedQueueCount > 0 ? `，已选 ${selectedQueueCount}` : ""}
-                      {loopCandidates.length > 0 ? `，循环候选 ${loopCandidates.length} 个` : ""}
-                      {loopFrame ? `，当前终点 ${formatVideoTime(loopFrame.time)}` : ""}
-                    </span>
-                  </div>
-                  <b className={queueReady ? "ready" : ""}>
-                    {queueReady ? "可生成" : "待选帧"}
-                  </b>
-                </div>
-                <label className="frame-loop-threshold">
-                  <span>循环相似度</span>
-                  <input
-                    max={0.99}
-                    min={0.7}
-                    onChange={(event) => setVideoLoopMinScore(Math.max(0.7, Math.min(0.99, Number(event.currentTarget.value) || DEFAULT_VIDEO_LOOP_MIN_SCORE)))}
-                    step={0.01}
-                    type="range"
-                    value={videoLoopMinScore}
-                  />
-                  <b>{videoLoopMinScore.toFixed(2)}</b>
-                </label>
-                <div className="frame-queue-actions">
-                  <button className="secondary-action" onClick={() => setAllVideoFrameSelections(true)} disabled={videoFrameSelections.length === 0} type="button">
-                    全选
-                  </button>
-                  <button className="secondary-action" onClick={() => setAllVideoFrameSelections(false)} disabled={selectedQueueCount === 0} type="button">
-                    取消选择
-                  </button>
-                  <button className="secondary-action" onClick={removeSelectedVideoFrames} disabled={selectedQueueCount === 0} type="button">
-                    删除选中
-                  </button>
-                  <button className="secondary-action" onClick={findVideoLoopFrame} disabled={videoFrameSelections.length < 3} type="button">
-                    寻找循环帧
-                  </button>
-                  <button className="secondary-action" onClick={trimVideoFramesToLoopPoint} disabled={!loopFrame} type="button">
-                    删除终点及后帧
-                  </button>
-                </div>
-                <div className="frame-queue-export-actions">
-                  <button className="secondary-action" onClick={() => exportVideoFrameQueue("png_sequence")} disabled={videoFrameSelections.length === 0} type="button">
-                    导出 PNG
-                  </button>
-                  <button className="secondary-action" onClick={() => exportVideoFrameQueue("gif")} disabled={videoFrameSelections.length === 0} type="button">
-                    导出 GIF
-                  </button>
-                  <button className="secondary-action" onClick={() => exportVideoFrameQueue("sheet")} disabled={videoFrameSelections.length === 0} type="button">
-                    导出 Sheet
-                  </button>
-                </div>
-                <div className="frame-selection-grid" style={{ gridTemplateColumns: `repeat(${Math.min(Math.max(queueLayout.columns, 2), 5)}, minmax(0, 1fr))` }}>
-                  {videoFrameSelections.map((selection, index) => (
-                    <button
-                      className={`frame-selection-tile filled ${selection.selected ? "selected" : ""} ${selection.loopHint ? "loop" : ""} ${selection.id === selectedLoopFrameId ? "loop-selected" : ""} ${videoSelectionPreviewIndex === index ? "previewing" : ""}`}
-                      draggable
-                      key={selection.id}
-                      onClick={() => handleVideoFrameTileClick(index)}
-                      onDragOver={(event) => event.preventDefault()}
-                      onDragStart={(event) => handleVideoFrameDragStart(event, index)}
-                      onDrop={(event) => handleVideoFrameDrop(event, index)}
-                      type="button"
-                    >
-                      <span>#{index + 1}</span>
-                      {selection.loopHint && <em>{selection.id === selectedLoopFrameId ? "终点" : "候选"} {selection.loopScore ? selection.loopScore.toFixed(2) : ""}</em>}
-                      {selection.thumbnail ? (
-                        <img src={selection.thumbnail} alt={`队列第 ${index + 1} 帧预览`} />
-                      ) : (
-                        <b className="thumbnail-pending">{formatVideoTime(selection.time)}</b>
-                      )}
-                      <div className="frame-tile-actions">
-                        <i
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            seekVideoFrameSelection(selection.time);
-                          }}
-                        >
-                          定位
-                        </i>
-                        <i
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            removeVideoFrameSelection(index);
-                          }}
-                        >
-                          移除
-                        </i>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-            <div className="alert-dialog-actions">
-              <AlertDialog.Cancel className="dialog-button secondary">关闭</AlertDialog.Cancel>
-              <AlertDialog.Action className="dialog-button" disabled={!queueReady}>
-                使用选帧
-              </AlertDialog.Action>
-            </div>
-          </AlertDialog.Content>
-        </AlertDialog.Portal>
-      </AlertDialog.Root>
-    );
-  }
+  const appContextValue = {
+    DEFAULT_VIDEO_LOOP_MIN_SCORE,
+    RailContext,
+    activeAssetName,
+    activePreviewPath,
+    activePreviewVersionId,
+    activeStreamSession,
+    addCurrentVideoFrame,
+    assetTreeData,
+    assetTreeSelectionId,
+    assetTypeLabel,
+    assets,
+    autoSelectVideoFramesByFps,
+    backend,
+    busy,
+    cancelActiveTask,
+    cancelRequested,
+    checkUnrealStatus,
+    chooseAndCreateProject,
+    chooseAndOpenProject,
+    clampVideoPickerTime,
+    clearGameUiTextureKit,
+    clearVideoSelectionPreview,
+    consoleOutputRef,
+    createProject,
+    currentImageBrowserTree,
+    currentManifest,
+    deleteAssetFromTree,
+    deleteAssetVersion,
+    disconnectProject,
+    endPreviewResize,
+    exportUnrealScript,
+    exportVideoFrameQueue,
+    findVideoLoopFrame,
+    flattenGameUiPreviewNodes,
+    forgetRecentProject,
+    formatRecentProjectTime,
+    formatVideoTime,
+    gameUiClearTextureKitTarget,
+    gameUiColorOrFallback,
+    gameUiPreviewCanvasRef,
+    gameUiPreviewCanvasWidth,
+    gameUiPreviewData,
+    gameUiPreviewLoading,
+    gameUiPreviewOpen,
+    handleConsoleScroll,
+    handleVideoFrameDragStart,
+    handleVideoFrameDrop,
+    handleVideoFrameTileClick,
+    hydrateVideoFrameSelectionThumbnails,
+    issueCount,
+    lastResult,
+    latestAssetThumbnailPath,
+    log,
+    movePreviewResize,
+    openProject,
+    pendingDelete,
+    playVideoLoopPreview,
+    playVideoSelectionPreview,
+    previewHeight,
+    previewName,
+    previewPath,
+    project,
+    projectName,
+    projectNameFromRoot,
+    projectPanelMode,
+    recentProjects,
+    removeSelectedVideoFrames,
+    removeVideoFrameSelection,
+    renderGameUiPreviewNode,
+    seekVideoFrameSelection,
+    selectAssetFromTree,
+    selectedAsset,
+    selectedKitNameFromPath,
+    selectedLoopFrameId,
+    selectedLoopFrameIndex,
+    selectedStructureNameFromPath,
+    setAllVideoFrameSelections,
+    setGameUiClearTextureKitTarget,
+    setGameUiPreviewOpen,
+    setPendingDelete,
+    setProjectName,
+    setProjectPanelMode,
+    setSelectedLoopFrameId,
+    setVideoAutoFps,
+    setVideoFramePickerOpen,
+    setVideoFrameSelections,
+    setVideoLoopMinScore,
+    setVideoPickerCurrentTime,
+    setVideoPickerDuration,
+    setVideoPreviewNaturalSize,
+    setVideoRangeEnd,
+    setVideoRangeStart,
+    setVideoSourceAspectRatio,
+    startPreviewResize,
+    stepVideoFrame,
+    taskProgress,
+    trimVideoFramesToLoopPoint,
+    unrealStatus,
+    updateVideoRangeEnd,
+    updateVideoRangeStart,
+    validateCurrentManifest,
+    validationResult,
+    versionDisplayLabel,
+    videoAutoFps,
+    videoFramePickerOpen,
+    videoFramePickerRef,
+    videoFrameThumbnailsLoading,
+    videoLoopMinScore,
+    videoLoopPreviewing,
+    videoPickerCurrentTime,
+    videoPickerDuration,
+    videoPreviewNaturalSize,
+    videoPreviewStageRef,
+    videoPreviewStageSize,
+    videoRangeEnd,
+    videoRangeStart,
+    videoSelectionPreviewIndex,
+    videoSelectionPreviewing,
+    videoSourceAspectRatio,
+    workerBlocked,
+    AssetPreview,
+    CommandCombobox,
+    DEFAULT_GAME_UI_TEXTURE_BATCH_COUNT,
+    DEFAULT_GAME_UI_TEXTURE_STATE_COUNT,
+    DEFAULT_GAME_UI_TEXTURE_TOKEN_COUNT,
+    DEFAULT_SEEDANCE_ENDPOINT,
+    DEFAULT_SEEDANCE_MODEL,
+    DEFAULT_SEEDANCE_RESOLUTION,
+    EditableCommandCombobox,
+    GAME_UI_CHROMA_PRESETS,
+    PIXEL_MASK_MODE_OPTIONS,
+    PIXEL_RESTORE_MODE_OPTIONS,
+    SEEDANCE_MODEL_OPTIONS,
+    SlotPicker,
+    TILEMAP_STANDARD_OPTIONS,
+    WorkerAlert,
+    absoluteMcpRoot,
+    anchorConceptReferencePath,
+    anchorOutputOptions,
+    anchorPathForDirection,
+    applyPixelKindSelection,
+    assetIdFromName,
+    assetName,
+    bakeGameUiHtml,
+    browserVersionDate,
+    checkNetworkProxy,
+    codexCallbackInput,
+    codexFlow,
+    codexOAuth,
+    completeCodexOAuthManually,
+    composeTilemapFromSeed,
+    contentPath,
+    copyGameUiDslPrompt,
+    copyPixelMcpConfig,
+    createTilemapManifest,
+    currentCutoutRole,
+    currentPixelActionId,
+    currentPixelActionLabel,
+    currentSeedanceModel,
+    currentSeedanceResolution,
+    currentSheetDirection,
+    currentSheetRole,
+    currentVideoDirection,
+    currentVideoSourcePath,
+    cutoutSourceSlot,
+    defaultSeedanceModel,
+    defaultSeedanceResolution,
+    deleteCurrentUiConcept,
+    deleteGameUiHtml,
+    deleteGameUiStructure,
+    deleteModel,
+    disabled,
+    disconnectCodexOAuth,
+    downloadSam,
+    exportGameUiUmg,
+    gameUiAdvancedTokensOpen,
+    gameUiChromaPreset,
+    gameUiConceptVersionChoices,
+    gameUiCustomChromaHex,
+    gameUiHtmlDraft,
+    gameUiHtmlPath,
+    gameUiHtmlPrototypes,
+    gameUiKitFilesJson,
+    gameUiKitName,
+    gameUiKitSelectionValue,
+    gameUiScreenName,
+    gameUiSelectedChromaHex,
+    gameUiSelectedChromaRgb,
+    gameUiSelectedKitPath,
+    gameUiStructurePath,
+    gameUiStructures,
+    gameUiTab,
+    gameUiTextureDebugArtifacts,
+    gameUiTextureKits,
+    gameUiTextureMaxConcurrency,
+    gameUiWidgetTokensJson,
+    generateGameUiTextureKit,
+    generatePixelAnchor,
+    generatePixelConcept,
+    generatePixelSheet,
+    generatePixelSheetFromVideo,
+    generateSeedanceVideo,
+    generateTilemapSeedConcept,
+    generateUiConcept,
+    handlePixelMatrixCellClick,
+    huggingFaceTokenDraft,
+    imageProvider,
+    importPixelSheet,
+    importUiConcept,
+    installMarker,
+    installedCount,
+    knownActionLabel,
+    mcpRuntimePaths,
+    modelCacheDir,
+    modelDependencies,
+    modelStatusLabel,
+    models,
+    networkCheck,
+    networkProxyDraft,
+    normalizePixelSheet,
+    normalizeSourceSlot,
+    openAiBaseUrlDraft,
+    openAiKeyDraft,
+    openGameUiSkinPreview,
+    openVideoFramePicker,
+    pixelAction,
+    pixelActionDescription,
+    pixelActionMenuOpen,
+    pixelActionOptions,
+    pixelActionQuery,
+    pixelAnchorOutputSize,
+    pixelAnchorUseConcept,
+    pixelAttackName,
+    pixelBatchQueue,
+    pixelCellSize,
+    pixelColumns,
+    pixelConceptPath,
+    pixelCustomActionName,
+    pixelCutoutPath,
+    pixelDebugArtifacts,
+    pixelDecontaminateEdges,
+    pixelDirection,
+    pixelDirectionLabel,
+    pixelDynamicEffect,
+    pixelEffectColor,
+    pixelI2vActionDescription,
+    pixelKind,
+    pixelKindCopy,
+    pixelKindLabel,
+    pixelMaskMode,
+    pixelMatrixActionLabel,
+    pixelMatrixActions,
+    pixelMatrixCellKey,
+    pixelMatrixCellState,
+    pixelMatrixDirections,
+    pixelMatrixSelection,
+    pixelMcpBackendPath,
+    pixelMcpPythonPath,
+    pixelMirrorEastFromWest,
+    pixelPreviewOpen,
+    pixelProjectileEffect,
+    pixelRestoreMode,
+    pixelRows,
+    pixelSeedanceSeconds,
+    pixelSheetMode,
+    pixelSheetPath,
+    pixelStage,
+    pixelSubject,
+    pixelTileSetPath,
+    pixelTileSize,
+    pixelTilemapSeedPath,
+    pixelTilemapStandard,
+    pixelTilemapSubject,
+    pixelVideoPath,
+    previewUrlForPath,
+    projectRoot,
+    pushLog,
+    refreshCodexOAuth,
+    refreshGameUiWorkspace,
+    refreshModels,
+    registerGameUiTextureKit,
+    rembgModel,
+    removePixelSheetBackground,
+    requestClearGameUiTextureKit,
+    runAction,
+    runPixelBatch,
+    runtimeSettings,
+    saveGameUiHtml,
+    saveRuntimeSettings,
+    seedanceEndpointDraft,
+    seedanceKeyDraft,
+    seedanceModelDraft,
+    seedanceResolutionDraft,
+    seedanceResolutionOptions,
+    selectGameUiConceptVersion,
+    selectGameUiHtmlPrototype,
+    selectGameUiKitName,
+    selectedGameUiTextureKit,
+    setActivePreviewLabel,
+    setActivePreviewPath,
+    setActivePreviewVersionId,
+    setAssetName,
+    setCodexCallbackInput,
+    setContentPath,
+    setGameUiAdvancedTokensOpen,
+    setGameUiChromaPreset,
+    setGameUiCustomChromaHex,
+    setGameUiHtmlDraft,
+    setGameUiHtmlPath,
+    setGameUiKitFilesJson,
+    setGameUiSelectedKitPath,
+    setGameUiStructurePath,
+    setGameUiTab,
+    setGameUiTextureDebugArtifacts,
+    setGameUiTextureMaxConcurrency,
+    setGameUiWidgetTokensJson,
+    setHuggingFaceTokenDraft,
+    setImageProvider,
+    setNetworkProxyDraft,
+    setOpenAiBaseUrlDraft,
+    setOpenAiKeyDraft,
+    setPixelActionDescription,
+    setPixelActionFromId,
+    setPixelActionMenuOpen,
+    setPixelActionQuery,
+    setPixelAnchorUseConcept,
+    setPixelAttackName,
+    setPixelColumns,
+    setPixelConceptPath,
+    setPixelCustomActionName,
+    setPixelDebugArtifacts,
+    setPixelDecontaminateEdges,
+    setPixelDirection,
+    setPixelDynamicEffect,
+    setPixelEffectColor,
+    setPixelI2vActionDescription,
+    setPixelMaskMode,
+    setPixelMatrixSelection,
+    setPixelMirrorEastFromWest,
+    setPixelPreviewOpen,
+    setPixelProjectileEffect,
+    setPixelRestoreMode,
+    setPixelRows,
+    setPixelSeedanceResolution,
+    setPixelSeedanceSeconds,
+    setPixelSheetMode,
+    setPixelStage,
+    setPixelSubject,
+    setPixelTileSetPath,
+    setPixelTileSize,
+    setPixelTilemapSeedPath,
+    setPixelTilemapStandard,
+    setPixelTilemapSubject,
+    setPixelVideoPath,
+    setRembgModel,
+    setSeedanceEndpointDraft,
+    setSeedanceKeyDraft,
+    setSeedanceResolutionDraft,
+    setTilemapImportOpen,
+    setUiAssetName,
+    setUiGameDescription,
+    setUiLayout,
+    setUnrealMcpUrlDraft,
+    startCodexOAuth,
+    tilemapImportOpen,
+    tilemapStandardOption,
+    togglePixelMatrixCell,
+    uiAssetName,
+    uiConceptSlot,
+    uiGameDescription,
+    uiLayout,
+    unrealMcpUrlDraft,
+    updatePixelAnchorOutputSize,
+    updatePixelCellSize,
+    updatePixelSeedanceModel,
+    updateSeedanceModelDraft,
+    useDismissableCombobox,
+    versionRoleLabel,
+    videoFrameSelections,
+    videoSheetLayoutForFrameCount,
+    videoSourceSlot
+  };
 
   return (
-    <main className="app-shell">
-      {ProjectSidebar()}
+    <AppContext.Provider value={appContextValue}>
+      <main className="app-shell">
+      <Suspense fallback={null}>
+        <ProjectSidebar />
+      </Suspense>
       <section className="workbench-shell">
         {TopTabs()}
         <div className="workbench-body">
           <section className="main-workspace">
             {PageTitle()}
             <div className="workspace-scroll">
-              {MainPage()}
+              <Suspense fallback={null}>
+                {MainPage()}
+              </Suspense>
             </div>
           </section>
-          {RightPanel()}
+          <Suspense fallback={null}>
+            <RightPanel />
+          </Suspense>
         </div>
       </section>
-      {DeleteConfirmDialog()}
-      {GameUiSkinPreviewDialog()}
-      {GameUiClearTextureKitDialog()}
-      {VideoFramePickerDialog()}
-    </main>
+      <Suspense fallback={null}>
+        <AppDialogs />
+      </Suspense>
+      </main>
+    </AppContext.Provider>
   );
 }
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <PhotoProvider maskOpacity={0.88}>
-      <App />
-    </PhotoProvider>
+    <App />
   </React.StrictMode>
 );

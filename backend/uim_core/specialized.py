@@ -39,6 +39,80 @@ TILEMAP_47_IDS = [
 ]
 TILEMAP_DUAL_GRID_16_IDS = [f"mask_{mask:02d}" for mask in range(16)]
 TILEMAP_DUAL_GRID_16_MASK_BITS = {"NW": 1, "NE": 2, "SW": 4, "SE": 8}
+TILEMAP_TERRAIN_MASK_BITS = {"N": 1, "E": 2, "S": 4, "W": 8, "NE": 16, "SE": 32, "SW": 64, "NW": 128}
+
+
+def _terrain_mask(*, n: bool, e: bool, s: bool, w: bool, ne: bool = False, se: bool = False, sw: bool = False, nw: bool = False) -> int:
+    mask = 0
+    if n:
+        mask |= TILEMAP_TERRAIN_MASK_BITS["N"]
+    if e:
+        mask |= TILEMAP_TERRAIN_MASK_BITS["E"]
+    if s:
+        mask |= TILEMAP_TERRAIN_MASK_BITS["S"]
+    if w:
+        mask |= TILEMAP_TERRAIN_MASK_BITS["W"]
+    if ne and n and e:
+        mask |= TILEMAP_TERRAIN_MASK_BITS["NE"]
+    if se and s and e:
+        mask |= TILEMAP_TERRAIN_MASK_BITS["SE"]
+    if sw and s and w:
+        mask |= TILEMAP_TERRAIN_MASK_BITS["SW"]
+    if nw and n and w:
+        mask |= TILEMAP_TERRAIN_MASK_BITS["NW"]
+    return mask
+
+
+def _valid_47_terrain_masks() -> list[int]:
+    masks: list[int] = []
+    for cardinal in range(16):
+        n = bool(cardinal & 1)
+        e = bool(cardinal & 2)
+        s = bool(cardinal & 4)
+        w = bool(cardinal & 8)
+        diagonal_candidates = [
+            ("NE", n and e),
+            ("SE", s and e),
+            ("SW", s and w),
+            ("NW", n and w),
+        ]
+        optional = [name for name, allowed in diagonal_candidates if allowed]
+        for diagonal_bits in range(1 << len(optional)):
+            masks.append(
+                _terrain_mask(
+                    n=n,
+                    e=e,
+                    s=s,
+                    w=w,
+                    ne="NE" in [optional[index] for index in range(len(optional)) if diagonal_bits & (1 << index)],
+                    se="SE" in [optional[index] for index in range(len(optional)) if diagonal_bits & (1 << index)],
+                    sw="SW" in [optional[index] for index in range(len(optional)) if diagonal_bits & (1 << index)],
+                    nw="NW" in [optional[index] for index in range(len(optional)) if diagonal_bits & (1 << index)],
+                )
+            )
+    return sorted(set(masks))
+
+
+_TILEMAP_47_PREFERRED_MASKS = [
+    _terrain_mask(n=True, e=True, s=True, w=True, ne=True, se=True, sw=True, nw=True),
+    _terrain_mask(n=False, e=True, s=True, w=True, se=True, sw=True),
+    _terrain_mask(n=True, e=True, s=False, w=True, ne=True, nw=True),
+    _terrain_mask(n=True, e=True, s=True, w=False, ne=True, se=True),
+    _terrain_mask(n=True, e=False, s=True, w=True, sw=True, nw=True),
+    _terrain_mask(n=False, e=True, s=True, w=False, se=True),
+    _terrain_mask(n=False, e=False, s=True, w=True, sw=True),
+    _terrain_mask(n=True, e=True, s=False, w=False, ne=True),
+    _terrain_mask(n=True, e=False, s=False, w=True, nw=True),
+    _terrain_mask(n=False, e=True, s=False, w=True),
+    _terrain_mask(n=True, e=False, s=True, w=False),
+    _terrain_mask(n=False, e=True, s=True, w=True, se=True),
+    _terrain_mask(n=True, e=True, s=False, w=True, ne=True),
+    _terrain_mask(n=True, e=True, s=True, w=True, ne=True, se=True, sw=True, nw=False),
+    _terrain_mask(n=True, e=True, s=True, w=True, ne=False, se=True, sw=True, nw=True),
+    _terrain_mask(n=True, e=True, s=True, w=True, ne=True, se=True, sw=False, nw=True),
+    _terrain_mask(n=True, e=True, s=True, w=True, ne=True, se=False, sw=True, nw=True),
+]
+TILEMAP_47_TERRAIN_MASKS = (_TILEMAP_47_PREFERRED_MASKS + [mask for mask in _valid_47_terrain_masks() if mask not in _TILEMAP_47_PREFERRED_MASKS])[:47]
 
 
 def _video_ffmpeg_executable() -> tuple[str, str]:
@@ -102,16 +176,25 @@ def _generate_image(
     size: str = "1024x1024",
     reference_path: Path | None = None,
     reference_paths: Sequence[Path] | None = None,
+    mask_path: Path | None = None,
 ) -> ImageGenerationResult:
     provider = _provider(image_provider)
     references = list(reference_paths or ([] if reference_path is None else [reference_path]))
+    native_mask_path = mask_path if image_provider == "openai_api" else None
+    if mask_path is not None:
+        if not mask_path.exists() or not mask_path.is_file():
+            raise ValueError(f"Edit mask image does not exist: {mask_path}")
+        if native_mask_path is None:
+            references.append(mask_path)
     if references:
         for path in references:
             if not path.exists() or not path.is_file():
                 raise ValueError(f"Reference image does not exist: {path}")
-        if len(references) > 1:
+        if len(references) > 1 or native_mask_path is not None:
             edit_many = getattr(provider, "edit_many", None)
             if callable(edit_many):
+                if native_mask_path is not None:
+                    return edit_many(prompt, references, output_path, size=size, mask_path=native_mask_path)
                 return edit_many(prompt, references, output_path, size=size)
         edit = getattr(provider, "edit", None)
         if callable(edit) and len(references) == 1:
@@ -1902,6 +1985,860 @@ def create_video_debug_export(
     return manifest
 
 
+def _tilemap_seed_prompt(subject: str, standard: str, tile_size: int) -> str:
+    terrain_subject = subject.strip() or "lush grass terrain transitioning into compact dirt ground"
+    standard_label = "47-tile mixed terrain set" if standard == "47-tile" else "dual-grid 16 corner terrain set"
+    return (
+        f"Create a pixel-art terrain style reference image for a {standard_label}.\n\n"
+        f"Terrain idea: {terrain_subject}\n\n"
+        "Purpose:\n"
+        "- this image is a style reference only, not a structural tileset guide\n"
+        "- show the primary terrain material, the outer terrain material, and a few natural transition-edge examples\n"
+        "- prioritize material identity, palette, texture density, edge language, and top-down RPG readability\n\n"
+        "Canvas requirements:\n"
+        "- square PNG, no text, no labels, no watermark, no UI frame\n"
+        f"- crisp chunky pixel art suitable for {tile_size}x{tile_size} terrain tiles after downscaling\n"
+        "- orthographic top-down RPG terrain texture\n"
+        "- include enough full primary terrain and full outer terrain regions for later style sampling\n\n"
+        "Important constraints:\n"
+        "- do not attempt to solve the final 47-tile or dual-grid structure here\n"
+        "- the final tile geometry will be controlled by a separate black/white Wang guide\n"
+        "- preserve consistent lighting, palette, scale, and texture density"
+    )
+
+
+def _nearest_resample(Image):
+    return getattr(getattr(Image, "Resampling", Image), "NEAREST")
+
+
+def _normalize_tilemap_seed(source_path: Path, output_path: Path, tile_size: int) -> None:
+    Image, _, _ = _require_pillow()
+    with Image.open(source_path) as image:
+        rgba = image.convert("RGBA")
+        side = min(rgba.size)
+        left = max(0, (rgba.width - side) // 2)
+        top = max(0, (rgba.height - side) // 2)
+        cropped = rgba.crop((left, top, left + side, top + side))
+        normalized = cropped.resize((tile_size * 3, tile_size * 3), _nearest_resample(Image))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized.save(output_path)
+
+
+def _tilemap_sheet_dimensions(standard: str, tile_size: int) -> tuple[int, int, int, int]:
+    if standard == "47-tile":
+        columns = 8
+        count = len(TILEMAP_47_IDS)
+    elif standard == "dual-grid-16":
+        columns = 4
+        count = len(TILEMAP_DUAL_GRID_16_IDS)
+    else:
+        raise ValueError(f"Unsupported tilemap standard: {standard}")
+    rows = math.ceil(count / columns)
+    return columns, rows, columns * tile_size, rows * tile_size
+
+
+def _normalize_tilemap_tileset(source_path: Path, output_path: Path, standard: str, tile_size: int) -> None:
+    Image, _, _ = _require_pillow()
+    _, _, width, height = _tilemap_sheet_dimensions(standard, tile_size)
+    with Image.open(source_path) as image:
+        rgba = image.convert("RGBA")
+        source_ratio = rgba.width / max(1, rgba.height)
+        target_ratio = width / max(1, height)
+        if source_ratio > target_ratio:
+            crop_width = max(1, round(rgba.height * target_ratio))
+            left = max(0, (rgba.width - crop_width) // 2)
+            rgba = rgba.crop((left, 0, left + crop_width, rgba.height))
+        elif source_ratio < target_ratio:
+            crop_height = max(1, round(rgba.width / target_ratio))
+            top = max(0, (rgba.height - crop_height) // 2)
+            rgba = rgba.crop((0, top, rgba.width, top + crop_height))
+        sheet = rgba.resize((width, height), _nearest_resample(Image))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path)
+
+
+def _tilemap_masks_for_standard(standard: str) -> list[int]:
+    if standard == "47-tile":
+        return TILEMAP_47_TERRAIN_MASKS
+    if standard == "dual-grid-16":
+        return list(range(16))
+    raise ValueError(f"Unsupported tilemap standard: {standard}")
+
+
+def _tilemap_guide_tile_size(tile_size: int) -> int:
+    return max(64, tile_size * 2)
+
+
+def _tilemap_wang_source_dimensions(tile_size: int) -> tuple[int, int]:
+    return 5 * tile_size, 3 * tile_size
+
+
+def _pixel_toward_center(value: int, size: int, positive_direction: bool) -> bool:
+    return value >= size // 2 if positive_direction else value < size // 2
+
+
+def _distance_sq(dx: int, dy: int) -> int:
+    return dx * dx + dy * dy
+
+
+def _center_corner_rounded_value(x: int, y: int, tile_size: int, quadrant_states: tuple[bool, bool, bool, bool], base_value: bool) -> bool:
+    half = tile_size // 2
+    if half <= 0:
+        return base_value
+    corner_radius = max(3, half // 4)
+    radius_sq = corner_radius ** 2
+    nw, ne, sw, se = quadrant_states
+    if x < half and y < half:
+        active = nw
+        orthogonal_a = ne
+        orthogonal_b = sw
+        corner_x = half - corner_radius
+        corner_y = half - corner_radius
+        in_corner_zone = x >= corner_x and y >= corner_y
+        distance_sq = _distance_sq(x - corner_x, y - corner_y)
+    elif x >= half and y < half:
+        active = ne
+        orthogonal_a = nw
+        orthogonal_b = se
+        corner_x = half + corner_radius - 1
+        corner_y = half - corner_radius
+        in_corner_zone = x <= corner_x and y >= corner_y
+        distance_sq = _distance_sq(x - corner_x, y - corner_y)
+    elif x < half and y >= half:
+        active = sw
+        orthogonal_a = nw
+        orthogonal_b = se
+        corner_x = half - corner_radius
+        corner_y = half + corner_radius - 1
+        in_corner_zone = x >= corner_x and y <= corner_y
+        distance_sq = _distance_sq(x - corner_x, y - corner_y)
+    else:
+        active = se
+        orthogonal_a = ne
+        orthogonal_b = sw
+        corner_x = half + corner_radius - 1
+        corner_y = half + corner_radius - 1
+        in_corner_zone = x <= corner_x and y <= corner_y
+        distance_sq = _distance_sq(x - corner_x, y - corner_y)
+    if active and not orthogonal_a and not orthogonal_b and in_corner_zone:
+        return distance_sq <= radius_sq
+    if not active and orthogonal_a and orthogonal_b and in_corner_zone:
+        return distance_sq > radius_sq
+    return base_value
+
+
+def _is_primary_47_mask_pixel_base(mask: int, x: int, y: int, tile_size: int) -> bool:
+    bits = TILEMAP_TERRAIN_MASK_BITS
+    half = tile_size // 2
+    if half <= 0:
+        return True
+    left = x < half
+    top = y < half
+    local_x = x if left else x - half
+    local_y = y if top else y - half
+    horizontal_toward_center = _pixel_toward_center(local_x, half, left)
+    vertical_toward_center = _pixel_toward_center(local_y, half, top)
+    x_from_outer = local_x if left else half - 1 - local_x
+    y_from_outer = local_y if top else half - 1 - local_y
+    x_from_inner = half - 1 - local_x if left else local_x
+    y_from_inner = half - 1 - local_y if top else local_y
+    corner_radius = max(3, half // 4)
+    outer_radius_sq = corner_radius ** 2
+    inner_radius_sq = max(1, half - corner_radius) ** 2
+    vertical_neighbor = bool(mask & (bits["N"] if top else bits["S"]))
+    horizontal_neighbor = bool(mask & (bits["W"] if left else bits["E"]))
+    if top and left:
+        diagonal_neighbor = bool(mask & bits["NW"])
+    elif top and not left:
+        diagonal_neighbor = bool(mask & bits["NE"])
+    elif not top and left:
+        diagonal_neighbor = bool(mask & bits["SW"])
+    else:
+        diagonal_neighbor = bool(mask & bits["SE"])
+    if vertical_neighbor and horizontal_neighbor and diagonal_neighbor:
+        return True
+    if vertical_neighbor and horizontal_neighbor and not diagonal_neighbor:
+        return _distance_sq(x_from_outer, y_from_outer) >= outer_radius_sq
+    if vertical_neighbor and not horizontal_neighbor:
+        return horizontal_toward_center
+    if horizontal_neighbor and not vertical_neighbor:
+        return vertical_toward_center
+    return horizontal_toward_center and vertical_toward_center and _distance_sq(x_from_inner, y_from_inner) <= inner_radius_sq
+
+
+def _is_primary_47_mask_pixel(mask: int, x: int, y: int, tile_size: int) -> bool:
+    base_value = _is_primary_47_mask_pixel_base(mask, x, y, tile_size)
+    half = tile_size // 2
+    if half <= 1:
+        return base_value
+    sample = half // 2
+    quadrant_states = (
+        _is_primary_47_mask_pixel_base(mask, sample, sample, tile_size),
+        _is_primary_47_mask_pixel_base(mask, half + sample, sample, tile_size),
+        _is_primary_47_mask_pixel_base(mask, sample, half + sample, tile_size),
+        _is_primary_47_mask_pixel_base(mask, half + sample, half + sample, tile_size),
+    )
+    return _center_corner_rounded_value(x, y, tile_size, quadrant_states, base_value)
+
+
+def _is_primary_dual_grid_mask_pixel(mask: int, x: int, y: int, tile_size: int) -> bool:
+    if tile_size <= 1:
+        return bool(mask)
+    half = tile_size // 2
+    nw = bool(mask & TILEMAP_DUAL_GRID_16_MASK_BITS["NW"])
+    ne = bool(mask & TILEMAP_DUAL_GRID_16_MASK_BITS["NE"])
+    sw = bool(mask & TILEMAP_DUAL_GRID_16_MASK_BITS["SW"])
+    se = bool(mask & TILEMAP_DUAL_GRID_16_MASK_BITS["SE"])
+    if not any([nw, ne, sw, se]):
+        return False
+    if all([nw, ne, sw, se]):
+        return True
+    if x < half and y < half:
+        active = nw
+    elif x >= half and y < half:
+        active = ne
+    elif x < half and y >= half:
+        active = sw
+    else:
+        active = se
+    return _center_corner_rounded_value(x, y, tile_size, (nw, ne, sw, se), active)
+
+
+def _create_tilemap_mask_guide(output_path: Path, standard: str, tile_size: int) -> tuple[list[int], int]:
+    Image, _, _ = _require_pillow()
+    guide_tile_size = _tilemap_guide_tile_size(tile_size)
+    columns, rows, width, height = _tilemap_sheet_dimensions(standard, guide_tile_size)
+    masks = _tilemap_masks_for_standard(standard)
+    primary = (12, 12, 12, 255)
+    outer = (245, 245, 245, 255)
+    separator = (178, 178, 178, 255)
+    sheet = Image.new("RGBA", (width, height), outer)
+    for index, mask in enumerate(masks):
+        tile_x = (index % columns) * guide_tile_size
+        tile_y = (index // columns) * guide_tile_size
+        for y in range(guide_tile_size):
+            for x in range(guide_tile_size):
+                is_primary = False
+                if standard == "dual-grid-16":
+                    is_primary = _is_primary_dual_grid_mask_pixel(mask, x, y, guide_tile_size)
+                else:
+                    is_primary = _is_primary_47_mask_pixel(mask, x, y, guide_tile_size)
+                if is_primary:
+                    sheet.putpixel((tile_x + x, tile_y + y), primary)
+    for col in range(columns + 1):
+        x = min(width - 1, col * guide_tile_size)
+        for y in range(height):
+            sheet.putpixel((x, y), separator)
+    for row in range(rows + 1):
+        y = min(height - 1, row * guide_tile_size)
+        for x in range(width):
+            sheet.putpixel((x, y), separator)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path)
+    return masks, guide_tile_size
+
+
+def _wang_source_quadrants_for_cell(col: int, row: int) -> tuple[bool, bool, bool, bool]:
+    cells: dict[tuple[int, int], tuple[bool, bool, bool, bool]] = {
+        (0, 0): (False, False, False, True),
+        (1, 0): (False, False, True, True),
+        (2, 0): (False, False, True, False),
+        (0, 1): (False, True, False, True),
+        (1, 1): (True, True, True, True),
+        (2, 1): (True, False, True, False),
+        (0, 2): (False, True, False, False),
+        (1, 2): (True, True, False, False),
+        (2, 2): (True, False, False, False),
+        (3, 0): (False, True, True, True),
+        (4, 0): (True, False, True, True),
+        (3, 1): (True, True, False, True),
+        (4, 1): (True, True, True, False),
+        (3, 2): (False, False, False, False),
+        (4, 2): (True, True, True, True),
+    }
+    return cells[(col, row)]
+
+
+def _is_primary_quadrant_source_pixel(quadrants: tuple[bool, bool, bool, bool], x: int, y: int, tile_size: int) -> bool:
+    half = tile_size // 2
+    if x < half and y < half:
+        active = quadrants[0]
+    elif x >= half and y < half:
+        active = quadrants[1]
+    elif x < half and y >= half:
+        active = quadrants[2]
+    else:
+        active = quadrants[3]
+    return _center_corner_rounded_value(x, y, tile_size, quadrants, active)
+
+
+def _create_tilemap_wang_source_guide(output_path: Path, tile_size: int) -> int:
+    Image, _, _ = _require_pillow()
+    guide_tile_size = _tilemap_guide_tile_size(tile_size)
+    width, height = _tilemap_wang_source_dimensions(guide_tile_size)
+    primary = (12, 12, 12, 255)
+    outer = (245, 245, 245, 255)
+    separator = (178, 178, 178, 255)
+    sheet = Image.new("RGBA", (width, height), outer)
+    for row in range(3):
+        for col in range(5):
+            tile_x = col * guide_tile_size
+            tile_y = row * guide_tile_size
+            quadrants = _wang_source_quadrants_for_cell(col, row)
+            for y in range(guide_tile_size):
+                for x in range(guide_tile_size):
+                    if _is_primary_quadrant_source_pixel(quadrants, x, y, guide_tile_size):
+                        sheet.putpixel((tile_x + x, tile_y + y), primary)
+    for col in range(6):
+        x = min(width - 1, col * guide_tile_size)
+        for y in range(height):
+            sheet.putpixel((x, y), separator)
+    for row in range(4):
+        y = min(height - 1, row * guide_tile_size)
+        for x in range(width):
+            sheet.putpixel((x, y), separator)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path)
+    return guide_tile_size
+
+
+def _normalize_tilemap_wang_source(source_path: Path, output_path: Path, tile_size: int) -> None:
+    Image, _, _ = _require_pillow()
+    width, height = _tilemap_wang_source_dimensions(tile_size)
+    with Image.open(source_path) as image:
+        rgba = image.convert("RGBA")
+        source_ratio = rgba.width / max(1, rgba.height)
+        target_ratio = width / max(1, height)
+        if source_ratio > target_ratio:
+            crop_width = max(1, round(rgba.height * target_ratio))
+            left = max(0, (rgba.width - crop_width) // 2)
+            rgba = rgba.crop((left, 0, left + crop_width, rgba.height))
+        elif source_ratio < target_ratio:
+            crop_height = max(1, round(rgba.width / target_ratio))
+            top = max(0, (rgba.height - crop_height) // 2)
+            rgba = rgba.crop((0, top, rgba.width, top + crop_height))
+        normalized = rgba.resize((width, height), _nearest_resample(Image))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized.save(output_path)
+
+
+def _tilemap_material_pair_dimensions(tile_size: int) -> tuple[int, int]:
+    return 2 * tile_size, tile_size
+
+
+def _tilemap_material_pair_prompt(subject: str, standard: str, tile_size: int) -> str:
+    terrain_subject = subject.strip() or "lush grass terrain transitioning into compact dirt ground"
+    standard_label = "47-tile blob autotile" if standard == "47-tile" else "dual-grid 16 autotile"
+    return (
+        f"Create a 2-cell horizontal pixel-art terrain material swatch sheet for a {standard_label}.\n\n"
+        f"Terrain idea: {terrain_subject}\n\n"
+        "Reference image usage:\n"
+        "- any provided reference image is style reference only: borrow palette, pixel density, lighting, and material mood; do not copy its layout or shapes\n"
+        "- draw exactly two complete seamless material tiles, no transition edge between them\n"
+        "- left cell: full outer terrain, compact dirt ground only\n"
+        "- right cell: full primary terrain, grassy ground only\n"
+        "- both cells must be top-down RPG pixel art with matching camera, scale, and lighting\n"
+        "- no 5x3 Wang source, no 47-tile sheet, no 16-tile sheet, no labels, no grid lines, no padding, no watermark\n\n"
+        f"Output will be normalized to {2 * tile_size}x{tile_size}px as two {tile_size}x{tile_size}px material tiles."
+    )
+
+
+def _normalize_tilemap_material_pair(source_path: Path, output_path: Path, tile_size: int) -> None:
+    Image, _, _ = _require_pillow()
+    width, height = _tilemap_material_pair_dimensions(tile_size)
+    with Image.open(source_path) as image:
+        rgba = image.convert("RGBA")
+        source_ratio = rgba.width / max(1, rgba.height)
+        target_ratio = width / max(1, height)
+        if source_ratio > target_ratio:
+            crop_width = max(1, round(rgba.height * target_ratio))
+            left = max(0, (rgba.width - crop_width) // 2)
+            rgba = rgba.crop((left, 0, left + crop_width, rgba.height))
+        elif source_ratio < target_ratio:
+            crop_height = max(1, round(rgba.width / target_ratio))
+            top = max(0, (rgba.height - crop_height) // 2)
+            rgba = rgba.crop((0, top, rgba.width, top + crop_height))
+        normalized = rgba.resize((width, height), _nearest_resample(Image))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized.save(output_path)
+
+
+def _is_tilemap_wang_transition_pixel(quadrants: tuple[bool, bool, bool, bool], x: int, y: int, tile_size: int) -> bool:
+    radius = max(2, tile_size // 8)
+    center_value = _is_primary_quadrant_source_pixel(quadrants, x, y, tile_size)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            nx = x + dx
+            ny = y + dy
+            if nx < 0 or ny < 0 or nx >= tile_size or ny >= tile_size:
+                continue
+            if _is_primary_quadrant_source_pixel(quadrants, nx, ny, tile_size) != center_value:
+                return True
+    return False
+
+
+def _create_hard_wang_source_from_material_pair(material_pair_path: Path, output_path: Path, tile_size: int) -> None:
+    Image, _, _ = _require_pillow()
+    width, height = _tilemap_wang_source_dimensions(tile_size)
+    with Image.open(material_pair_path) as material_image:
+        materials = material_image.convert("RGBA")
+        if materials.size != _tilemap_material_pair_dimensions(tile_size):
+            materials = materials.resize(_tilemap_material_pair_dimensions(tile_size), _nearest_resample(Image))
+        outer = materials.crop((0, 0, tile_size, tile_size))
+        primary = materials.crop((tile_size, 0, tile_size * 2, tile_size))
+        outer_pixels = outer.load()
+        primary_pixels = primary.load()
+        output = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        output_pixels = output.load()
+        for row in range(3):
+            for col in range(5):
+                quadrants = _wang_source_quadrants_for_cell(col, row)
+                tile_x = col * tile_size
+                tile_y = row * tile_size
+                for y in range(tile_size):
+                    for x in range(tile_size):
+                        output_pixels[tile_x + x, tile_y + y] = primary_pixels[x, y] if _is_primary_quadrant_source_pixel(quadrants, x, y, tile_size) else outer_pixels[x, y]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output.save(output_path)
+
+
+def _create_tilemap_boundary_mask(output_path: Path, tile_size: int) -> None:
+    Image, _, _ = _require_pillow()
+    width, height = _tilemap_wang_source_dimensions(tile_size)
+    mask = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+    pixels = mask.load()
+    for row in range(3):
+        for col in range(5):
+            quadrants = _wang_source_quadrants_for_cell(col, row)
+            tile_x = col * tile_size
+            tile_y = row * tile_size
+            for y in range(tile_size):
+                for x in range(tile_size):
+                    if _is_tilemap_wang_transition_pixel(quadrants, x, y, tile_size):
+                        pixels[tile_x + x, tile_y + y] = (255, 255, 255, 0)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mask.save(output_path)
+
+
+def _tilemap_boundary_refine_prompt(subject: str, standard: str, tile_size: int) -> str:
+    terrain_subject = subject.strip() or "lush grass terrain transitioning into compact dirt ground"
+    standard_label = "47-tile blob autotile" if standard == "47-tile" else "dual-grid 16 autotile"
+    return (
+        f"Refine the boundary band of this programmatic 5x3 Wang terrain source for a {standard_label}.\n\n"
+        f"Terrain idea: {terrain_subject}\n\n"
+        "Reference image usage:\n"
+        "- image 1 is the hard 5x3 Wang source whose geometry is mandatory\n"
+        "- image 2 is style reference only: borrow palette, pixel density, and terrain mood; do not copy its layout\n"
+        "- image 3 is the full dirt / full grass material pair used by the hard source\n"
+        "- the edit mask marks the only boundary band that may change; if a mask is shown as an image, treat transparent/marked boundary pixels as editable and all other pixels as locked\n\n"
+        "Editing rules:\n"
+        "- preserve every Wang cell, tile boundary, centerline, corner shape, and material side exactly\n"
+        "- do not move the transition line, do not widen active terrain, and do not turn cells into circles\n"
+        "- add only natural pixel-art edge polish inside the boundary band: small grass tufts, dirt crumbs, tiny irregular edge noise, and color blending\n"
+        "- full dirt and full grass interiors must remain unchanged and seamless\n"
+        "- no labels, no grid lines, no padding, no watermark\n\n"
+        f"The final result will be normalized back to {5 * tile_size}x{3 * tile_size}px and assembled programmatically into the tileset."
+    )
+
+
+def _cleanup_boundary_refined_wang_source(refined_path: Path, hard_source_path: Path, boundary_mask_path: Path, output_path: Path, tile_size: int) -> None:
+    Image, _, _ = _require_pillow()
+    dimensions = _tilemap_wang_source_dimensions(tile_size)
+    with Image.open(refined_path) as refined_image, Image.open(hard_source_path) as hard_image, Image.open(boundary_mask_path) as mask_image:
+        refined = refined_image.convert("RGBA")
+        hard = hard_image.convert("RGBA")
+        mask = mask_image.convert("RGBA")
+        if refined.size != dimensions:
+            refined = refined.resize(dimensions, _nearest_resample(Image))
+        if hard.size != dimensions:
+            hard = hard.resize(dimensions, _nearest_resample(Image))
+        if mask.size != dimensions:
+            mask = mask.resize(dimensions, _nearest_resample(Image))
+        refined_pixels = refined.load()
+        hard_pixels = hard.load()
+        mask_pixels = mask.load()
+        output = Image.new("RGBA", dimensions, (0, 0, 0, 0))
+        output_pixels = output.load()
+        for y in range(dimensions[1]):
+            for x in range(dimensions[0]):
+                output_pixels[x, y] = refined_pixels[x, y] if mask_pixels[x, y][3] < 128 else hard_pixels[x, y]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output.save(output_path)
+
+
+def _safe_material_pixel(pixels, x: int, y: int, tile_size: int) -> tuple[int, int, int, int]:
+    border_guard = max(1, tile_size // 32)
+    sample_min = border_guard
+    sample_max = max(sample_min, tile_size - border_guard - 1)
+    return pixels[min(sample_max, max(sample_min, x)), min(sample_max, max(sample_min, y))]
+
+
+def _cleanup_tilemap_wang_source(source_path: Path, output_path: Path, tile_size: int) -> None:
+    Image, _, _ = _require_pillow()
+    with Image.open(source_path) as source_image:
+        source = source_image.convert("RGBA")
+        if source.size != _tilemap_wang_source_dimensions(tile_size):
+            source = source.resize(_tilemap_wang_source_dimensions(tile_size), _nearest_resample(Image))
+        primary_tile = _wang_source_tile(source, tile_size, 4, 2)
+        outer_tile = _wang_source_tile(source, tile_size, 3, 2)
+        cleaned = Image.new("RGBA", source.size, (0, 0, 0, 0))
+        border_guard = max(1, tile_size // 32)
+
+        for row in range(3):
+            for col in range(5):
+                quadrants = _wang_source_quadrants_for_cell(col, row)
+                source_tile = _wang_source_tile(source, tile_size, col, row)
+                source_pixels = source_tile.load()
+                primary_pixels = primary_tile.load()
+                outer_pixels = outer_tile.load()
+                cleaned_tile = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
+                cleaned_pixels = cleaned_tile.load()
+                for y in range(tile_size):
+                    for x in range(tile_size):
+                        is_primary = _is_primary_quadrant_source_pixel(quadrants, x, y, tile_size)
+                        near_sheet_grid = x < border_guard or y < border_guard or x >= tile_size - border_guard or y >= tile_size - border_guard
+                        if not near_sheet_grid and _is_tilemap_wang_transition_pixel(quadrants, x, y, tile_size):
+                            cleaned_pixels[x, y] = source_pixels[x, y]
+                        else:
+                            cleaned_pixels[x, y] = _safe_material_pixel(primary_pixels, x, y, tile_size) if is_primary else _safe_material_pixel(outer_pixels, x, y, tile_size)
+                cleaned.paste(cleaned_tile, (col * tile_size, row * tile_size))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned.save(output_path)
+
+
+def _is_tilemap_mask_transition_pixel(is_primary_at: Callable[[int, int], bool], x: int, y: int, tile_size: int) -> bool:
+    radius = max(1, tile_size // 16)
+    center_value = is_primary_at(x, y)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            nx = x + dx
+            ny = y + dy
+            if nx < 0 or ny < 0 or nx >= tile_size or ny >= tile_size:
+                continue
+            if is_primary_at(nx, ny) != center_value:
+                return True
+    return False
+
+
+def _cleanup_composed_tile_geometry(tile, source, tile_size: int, is_primary_at: Callable[[int, int], bool]):
+    Image, _, _ = _require_pillow()
+    primary = _wang_source_tile(source, tile_size, 4, 2)
+    outer = _wang_source_tile(source, tile_size, 3, 2)
+    tile_pixels = tile.load()
+    primary_pixels = primary.load()
+    outer_pixels = outer.load()
+    output = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
+    output_pixels = output.load()
+    for y in range(tile_size):
+        for x in range(tile_size):
+            is_primary = is_primary_at(x, y)
+            if _is_tilemap_mask_transition_pixel(is_primary_at, x, y, tile_size):
+                output_pixels[x, y] = tile_pixels[x, y]
+            else:
+                output_pixels[x, y] = _safe_material_pixel(primary_pixels, x, y, tile_size) if is_primary else _safe_material_pixel(outer_pixels, x, y, tile_size)
+    return output
+
+
+def _tilemap_wang_source_prompt(subject: str, standard: str, tile_size: int) -> str:
+    terrain_subject = subject.strip() or "lush grass terrain transitioning into compact dirt ground"
+    standard_label = "47-tile blob autotile" if standard == "47-tile" else "dual-grid 16 autotile"
+    return (
+        f"Using the provided terrain style reference and black/white 5x3 Wang source guide, generate a compact source sheet for a {standard_label}.\n\n"
+        f"Terrain idea: {terrain_subject}\n\n"
+        "Reference image usage:\n"
+        "- reference image 1 is style reference only: use it for material identity, palette, texture density, and edge language; do not copy its layout or geometry\n"
+        "- reference image 2 is the structural 5x3 Wang source guide: black means primary terrain, white means outer terrain; the Wang guide controls structure\n"
+        "- follow the 5 columns by 3 rows layout exactly; no labels, no numbers, no text, no padding, no watermark\n"
+        "- preserve the guide geometry but render it as natural pixel-art terrain, not black/white shapes\n"
+        "- keep seams aligned: matching primary and outer edges must tile cleanly when half-tiles and quarter-tiles are copied\n\n"
+        "5x3 cell meaning:\n"
+        "- columns 1-3 form the standard 3x3 outer transition source: top row outer corners/edge, middle row left edge/full primary/right edge, bottom row bottom corners/edge\n"
+        "- column 4 row 1 is the inner top-left cutout source; column 5 row 1 is inner top-right\n"
+        "- column 4 row 2 is inner bottom-left; column 5 row 2 is inner bottom-right\n"
+        "- column 4 row 3 is full outer terrain; column 5 row 3 is full primary terrain\n\n"
+        f"Output will be normalized to {5 * tile_size}x{3 * tile_size}px with {tile_size}x{tile_size}px source tiles. "
+        "The final full tileset will be assembled programmatically from this source sheet, so do not try to draw the final 47/16 tileset here."
+    )
+
+
+def _wang_source_tile(source, tile_size: int, col: int, row: int):
+    return source.crop((col * tile_size, row * tile_size, (col + 1) * tile_size, (row + 1) * tile_size))
+
+
+def _paste_tile_quarter(output, source_tile, tile_size: int, output_quarter: str, source_quarter: str | None = None) -> None:
+    half = tile_size // 2
+    boxes = {
+        "NW": (0, 0, half, half),
+        "NE": (half, 0, tile_size, half),
+        "SW": (0, half, half, tile_size),
+        "SE": (half, half, tile_size, tile_size),
+    }
+    output_box = boxes[output_quarter]
+    source_box = boxes[source_quarter or output_quarter]
+    output.paste(source_tile.crop(source_box), (output_box[0], output_box[1]))
+
+
+def _compose_wang_47_tile(source, tile_size: int, mask: int):
+    Image, _, _ = _require_pillow()
+    bits = TILEMAP_TERRAIN_MASK_BITS
+    output = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
+    source_cells = {
+        "center": (1, 1),
+        "top": (1, 0),
+        "bottom": (1, 2),
+        "left": (0, 1),
+        "right": (2, 1),
+        "outer_nw": (0, 0),
+        "outer_ne": (2, 0),
+        "outer_sw": (0, 2),
+        "outer_se": (2, 2),
+        "inner_nw": (3, 0),
+        "inner_ne": (4, 0),
+        "inner_sw": (3, 1),
+        "inner_se": (4, 1),
+    }
+
+    def source_for_quarter(quarter: str) -> tuple[int, int, str]:
+        if quarter == "NW":
+            vertical = bool(mask & bits["N"])
+            horizontal = bool(mask & bits["W"])
+            diagonal = bool(mask & bits["NW"])
+            vertical_edge = ("left", "NE")
+            horizontal_edge = ("top", "SW")
+            outer_quarter = "SE"
+        elif quarter == "NE":
+            vertical = bool(mask & bits["N"])
+            horizontal = bool(mask & bits["E"])
+            diagonal = bool(mask & bits["NE"])
+            vertical_edge = ("right", "NW")
+            horizontal_edge = ("top", "SE")
+            outer_quarter = "SW"
+        elif quarter == "SW":
+            vertical = bool(mask & bits["S"])
+            horizontal = bool(mask & bits["W"])
+            diagonal = bool(mask & bits["SW"])
+            vertical_edge = ("left", "SE")
+            horizontal_edge = ("bottom", "NW")
+            outer_quarter = "NE"
+        else:
+            vertical = bool(mask & bits["S"])
+            horizontal = bool(mask & bits["E"])
+            diagonal = bool(mask & bits["SE"])
+            vertical_edge = ("right", "SW")
+            horizontal_edge = ("bottom", "NE")
+            outer_quarter = "NW"
+        if vertical and horizontal:
+            col, row = source_cells["center" if diagonal else f"inner_{quarter.lower()}"]
+            return col, row, quarter
+        if vertical:
+            source_name, source_quarter = vertical_edge
+            col, row = source_cells[source_name]
+            return col, row, source_quarter
+        if horizontal:
+            source_name, source_quarter = horizontal_edge
+            col, row = source_cells[source_name]
+            return col, row, source_quarter
+        col, row = source_cells[f"outer_{quarter.lower()}"]
+        return col, row, outer_quarter
+
+    for quarter in ("NW", "NE", "SW", "SE"):
+        col, row, source_quarter = source_for_quarter(quarter)
+        _paste_tile_quarter(output, _wang_source_tile(source, tile_size, col, row), tile_size, quarter, source_quarter)
+    return _cleanup_composed_tile_geometry(output, source, tile_size, lambda x, y: _is_primary_47_mask_pixel(mask, x, y, tile_size))
+
+
+def _compose_wang_dual_grid_tile(source, tile_size: int, mask: int):
+    Image, _, _ = _require_pillow()
+    output = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
+    bits = TILEMAP_DUAL_GRID_16_MASK_BITS
+    states = {
+        "NW": bool(mask & bits["NW"]),
+        "NE": bool(mask & bits["NE"]),
+        "SW": bool(mask & bits["SW"]),
+        "SE": bool(mask & bits["SE"]),
+    }
+    active_quarters = {quarter for quarter, active in states.items() if active}
+    count = len(active_quarters)
+    source_cells = {
+        "center": (4, 2),
+        "outer": (3, 2),
+        "single_nw": (2, 2),
+        "single_ne": (0, 2),
+        "single_sw": (2, 0),
+        "single_se": (0, 0),
+        "top": (1, 2),
+        "bottom": (1, 0),
+        "left": (2, 1),
+        "right": (0, 1),
+        "inner_nw": (3, 0),
+        "inner_ne": (4, 0),
+        "inner_sw": (3, 1),
+        "inner_se": (4, 1),
+    }
+
+    def source_for_quarter(quarter: str) -> tuple[int, int]:
+        if count == 0:
+            return source_cells["outer"]
+        if count == 4:
+            return source_cells["center"]
+        if count == 3:
+            missing = next(name for name in ("NW", "NE", "SW", "SE") if name not in active_quarters)
+            return source_cells[f"inner_{missing.lower()}"]
+        if count == 2:
+            if active_quarters == {"NW", "NE"}:
+                return source_cells["top"]
+            if active_quarters == {"SW", "SE"}:
+                return source_cells["bottom"]
+            if active_quarters == {"NW", "SW"}:
+                return source_cells["left"]
+            if active_quarters == {"NE", "SE"}:
+                return source_cells["right"]
+            if quarter in active_quarters:
+                return source_cells[f"single_{quarter.lower()}"]
+            return source_cells["outer"]
+        if quarter in active_quarters:
+            return source_cells[f"single_{quarter.lower()}"]
+        return source_cells["outer"]
+
+    for quarter in ("NW", "NE", "SW", "SE"):
+        col, row = source_for_quarter(quarter)
+        _paste_tile_quarter(output, _wang_source_tile(source, tile_size, col, row), tile_size, quarter)
+    return _cleanup_composed_tile_geometry(output, source, tile_size, lambda x, y: _is_primary_dual_grid_mask_pixel(mask, x, y, tile_size))
+
+
+def _compose_tileset_from_wang_source(source_path: Path, output_path: Path, standard: str, tile_size: int) -> list[int]:
+    Image, _, _ = _require_pillow()
+    masks = _tilemap_masks_for_standard(standard)
+    columns, rows, width, height = _tilemap_sheet_dimensions(standard, tile_size)
+    with Image.open(source_path) as source_image:
+        source = source_image.convert("RGBA")
+        if source.size != _tilemap_wang_source_dimensions(tile_size):
+            source = source.resize(_tilemap_wang_source_dimensions(tile_size), _nearest_resample(Image))
+        sheet = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        for index, mask in enumerate(masks):
+            tile = _compose_wang_dual_grid_tile(source, tile_size, mask) if standard == "dual-grid-16" else _compose_wang_47_tile(source, tile_size, mask)
+            sheet.paste(tile, ((index % columns) * tile_size, (index // columns) * tile_size))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path)
+    return masks
+
+
+def _tilemap_tileset_prompt(subject: str, standard: str, tile_size: int) -> str:
+    terrain_subject = subject.strip() or "lush grass terrain transitioning into compact dirt ground"
+    columns, rows, width, height = _tilemap_sheet_dimensions(standard, tile_size)
+    if standard == "dual-grid-16":
+        rules = (
+            "- create exactly 16 dual-grid tiles in row-major mask order 0 through 15\n"
+            "- mask bit meaning: NW=1, NE=2, SW=4, SE=8\n"
+            "- each tile follows the quadrant mask guide: active corners occupy their quadrant, with only a small rounded arc near the tile center where the transition corner occurs\n"
+            "- adjacent two-corner masks use straight half-tile edges; diagonal and single-corner masks keep square quadrant structure with subtle center-corner rounding only\n"
+            "- three-corner masks are full primary terrain with one outer-terrain quadrant cut out and subtly rounded only at the center-facing corner\n"
+        )
+        standard_label = "dual-grid-16"
+    else:
+        rules = (
+            "- create exactly 47 complete RPG autotile transition tiles in row-major order\n"
+            "- include center, cardinal edges, outer corners, inner corners, and mixed transition cases\n"
+            "- every tile must be a finished seamless game tile, not a cropped piece of the style reference\n"
+        )
+        standard_label = "47-tile"
+    return (
+        f"Using the provided terrain style reference and black/white geometric mask guide, generate a complete {standard_label} pixel-art tileset sheet.\n\n"
+        f"Terrain idea: {terrain_subject}\n\n"
+        "Reference image usage:\n"
+        "- reference image 1 is style reference only: use it for material identity, palette, scale, texture density, and transition language; do not copy its layout or geometry\n"
+        "- reference image 2 is the black/white geometric mask guide with subtle small corner rounding: black means primary terrain, white means outer terrain\n"
+        "- follow the geometry, tile order, and occupied areas of the mask guide exactly, but render them as natural seamless terrain transitions\n"
+        "- preserve only the small corner arcs and curved transition hints from the mask guide; do not turn whole tiles into circles or large round blobs\n"
+        "- do not copy black/white colors from the mask guide into the final art\n"
+        "- do not crop, slice, copy, or mechanically rearrange the style reference image\n"
+        "- invent complete seamless tiles that match the reference style\n\n"
+        "Output sheet requirements:\n"
+        f"- exact logical layout: {columns} columns by {rows} rows, row-major order\n"
+        f"- final normalized asset will be {width}x{height}px with {tile_size}x{tile_size}px tiles\n"
+        "- no labels, no numbers, no grid lines, no watermark, no padding\n"
+        "- orthographic top-down RPG pixel terrain; crisp pixel texture; consistent lighting\n"
+        f"{rules}"
+        "- tile edges must tile seamlessly with matching neighboring materials"
+    )
+
+
+def _tile_from_sheet(sheet, tile_size: int, columns: int, index: int):
+    x = (index % columns) * tile_size
+    y = (index // columns) * tile_size
+    return sheet.crop((x, y, x + tile_size, y + tile_size))
+
+
+def _make_sample_terrain(width: int, height: int) -> list[list[bool]]:
+    cx = (width - 1) / 2
+    cy = (height - 1) / 2
+    rx = width * 0.36
+    ry = height * 0.34
+    cells: list[list[bool]] = []
+    for y in range(height):
+        row: list[bool] = []
+        for x in range(width):
+            value = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2
+            notch = (x > width * 0.58 and y < height * 0.42) or (x < width * 0.34 and y > height * 0.6)
+            row.append(value <= 1.0 and not notch)
+        cells.append(row)
+    return cells
+
+
+def _create_tilemap_preview(tileset_path: Path, output_path: Path, tile_size: int, standard: str, masks: list[int]) -> None:
+    Image, _, _ = _require_pillow()
+    sample = _make_sample_terrain(12, 8)
+    columns = 4 if standard == "dual-grid-16" else 8
+    with Image.open(tileset_path) as sheet_image:
+        sheet = sheet_image.convert("RGBA")
+    background = Image.new("RGBA", (len(sample[0]) * tile_size, len(sample) * tile_size), (0, 0, 0, 0))
+    if standard == "dual-grid-16":
+        empty_tile = _tile_from_sheet(sheet, tile_size, columns, 0)
+        for y in range(len(sample)):
+            for x in range(len(sample[0])):
+                background.paste(empty_tile, (x * tile_size, y * tile_size))
+        for y in range(len(sample) - 1):
+            for x in range(len(sample[0]) - 1):
+                mask = 0
+                if sample[y][x]:
+                    mask |= TILEMAP_DUAL_GRID_16_MASK_BITS["NW"]
+                if sample[y][x + 1]:
+                    mask |= TILEMAP_DUAL_GRID_16_MASK_BITS["NE"]
+                if sample[y + 1][x]:
+                    mask |= TILEMAP_DUAL_GRID_16_MASK_BITS["SW"]
+                if sample[y + 1][x + 1]:
+                    mask |= TILEMAP_DUAL_GRID_16_MASK_BITS["SE"]
+                background.paste(_tile_from_sheet(sheet, tile_size, columns, mask), (x * tile_size, y * tile_size))
+    else:
+        mask_to_index = {mask: index for index, mask in enumerate(masks)}
+        isolated_index = mask_to_index.get(0, 0)
+        isolated_tile = _tile_from_sheet(sheet, tile_size, columns, isolated_index)
+        outer_color = isolated_tile.getpixel((0, 0))
+        background = Image.new("RGBA", background.size, outer_color)
+
+        def occupied(px: int, py: int) -> bool:
+            return 0 <= py < len(sample) and 0 <= px < len(sample[0]) and sample[py][px]
+
+        for y, row in enumerate(sample):
+            for x, inside in enumerate(row):
+                if not inside:
+                    continue
+                mask = _terrain_mask(
+                    n=occupied(x, y - 1),
+                    e=occupied(x + 1, y),
+                    s=occupied(x, y + 1),
+                    w=occupied(x - 1, y),
+                    ne=occupied(x + 1, y - 1),
+                    se=occupied(x + 1, y + 1),
+                    sw=occupied(x - 1, y + 1),
+                    nw=occupied(x - 1, y - 1),
+                )
+                index = mask_to_index.get(mask, 0)
+                background.paste(_tile_from_sheet(sheet, tile_size, columns, index), (x * tile_size, y * tile_size))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    background.save(output_path)
+
+
 def _create_tilemap_manifest(
     project_root: Path,
     asset_name: str,
@@ -1916,6 +2853,7 @@ def _create_tilemap_manifest(
     file_role: str,
     label: str,
     extra_processing: dict[str, Any] | None = None,
+    extra_files: list[AssetFile] | None = None,
 ) -> AssetManifest:
     asset_id, _, manifests = _asset_dirs(project_root, asset_name)
     if not tileset_path.exists() or not tileset_path.is_file():
@@ -1938,13 +2876,15 @@ def _create_tilemap_manifest(
         asset_id=asset_id,
         display_name=asset_name,
         style_profile=style_id,
-        files=[AssetFile(role=file_role, path=rel_tileset)],
+        files=[AssetFile(role=file_role, path=rel_tileset), *(extra_files or [])],
         frames=frames,
         processing={"tilemap": tilemap_processing},
         targets={"unreal": {"contentPath": content_path, "create": ["Texture2D", "PaperTileSet"]}},
     )
     write_manifest(manifests / "manifest.json", manifest)
     register_asset_version(project_root, asset_name, rel_tileset, file_role, label, asset_id=asset_id, kind="tilemap")
+    for file in extra_files or []:
+        register_asset_version(project_root, asset_name, file.path, file.role, file.role, asset_id=asset_id, kind="tilemap")
     return manifest
 
 
@@ -1983,6 +2923,175 @@ def create_tilemap_dual_grid_manifest(project_root: Path, asset_name: str, tiles
             "maskRange": [0, 15],
             "maskOrder": "NW=1, NE=2, SW=4, SE=8",
         },
+    )
+
+
+def create_tilemap_seed_concept(
+    project_root: Path,
+    asset_name: str,
+    subject: str,
+    standard: str,
+    tile_size: int,
+    style_id: str,
+    image_provider: str,
+    content_path: str,
+) -> AssetManifest:
+    if standard not in {"47-tile", "dual-grid-16"}:
+        raise ValueError(f"Unsupported tilemap standard: {standard}")
+    asset_id, generated, manifests = _asset_dirs(project_root, asset_name)
+    standard_slug = standard.replace("-", "_")
+    raw_seed = generated / versioned_filename(f"{standard_slug}_seed_raw")
+    seed = generated / versioned_filename(f"{standard_slug}_seed_3x3")
+    prompt = _tilemap_seed_prompt(subject, standard, tile_size)
+    result = _generate_image(prompt, raw_seed, image_provider, size="1024x1024")
+    _normalize_tilemap_seed(raw_seed, seed, tile_size)
+    rel_seed = _rel(project_root, seed)
+    manifest = AssetManifest(
+        asset_type="texture",
+        asset_id=asset_id,
+        display_name=asset_name,
+        style_profile=style_id,
+        files=[AssetFile(role="seed:tilemap-3x3", path=rel_seed)],
+        processing={
+            "tilemapSeed": {
+                "standard": standard,
+                "tileSize": tile_size,
+                "subject": subject,
+                "prompt": prompt,
+                "model": result.model,
+                "provider": image_provider,
+                "providerBaseUrl": result.base_url,
+                "streamEvents": result.stream_events or [],
+            }
+        },
+        targets={"unreal": {"contentPath": content_path, "create": ["Texture2D"]}},
+    )
+    write_manifest(manifests / "manifest.json", manifest)
+    register_asset_version(project_root, asset_name, rel_seed, "seed:tilemap-3x3", "tilemap 3x3 seed", asset_id=asset_id, kind="tilemap")
+    return manifest
+
+
+def create_tilemap_from_seed_manifest(
+    project_root: Path,
+    asset_name: str,
+    seed_path: Path,
+    subject: str,
+    standard: str,
+    tile_size: int,
+    style_id: str,
+    image_provider: str,
+    content_path: str,
+) -> AssetManifest:
+    if standard not in {"47-tile", "dual-grid-16"}:
+        raise ValueError(f"Unsupported tilemap standard: {standard}")
+    if not seed_path.exists() or not seed_path.is_file():
+        raise ValueError(f"Tilemap seed image does not exist: {seed_path}")
+    _, generated, _ = _asset_dirs(project_root, asset_name)
+    standard_slug = standard.replace("-", "_")
+    normalized_seed = generated / versioned_filename(f"{standard_slug}_seed_3x3")
+    _normalize_tilemap_seed(seed_path, normalized_seed, tile_size)
+    raw_material_pair = generated / versioned_filename(f"{standard_slug}_materials_raw")
+    material_pair = generated / versioned_filename(f"{standard_slug}_materials")
+    hard_wang_source = generated / versioned_filename(f"{standard_slug}_wang_5x3_hard")
+    boundary_mask = generated / versioned_filename(f"{standard_slug}_wang_5x3_boundary_mask")
+    raw_refined_wang_source = generated / versioned_filename(f"{standard_slug}_wang_5x3_refined_raw")
+    normalized_refined_wang_source = generated / versioned_filename(f"{standard_slug}_wang_5x3_refined_ai")
+    wang_source = generated / versioned_filename(f"{standard_slug}_wang_5x3_source")
+    tileset = generated / versioned_filename(f"{standard_slug}_tileset")
+    preview = generated / versioned_filename(f"{standard_slug}_preview")
+    rel_seed = _rel(project_root, normalized_seed)
+    material_prompt = _tilemap_material_pair_prompt(subject, standard, tile_size)
+    material_result = _generate_image(material_prompt, raw_material_pair, image_provider, size="1536x768", reference_path=normalized_seed)
+    _normalize_tilemap_material_pair(raw_material_pair, material_pair, tile_size)
+    _create_hard_wang_source_from_material_pair(material_pair, hard_wang_source, tile_size)
+    _create_tilemap_boundary_mask(boundary_mask, tile_size)
+    refine_prompt = _tilemap_boundary_refine_prompt(subject, standard, tile_size)
+    refine_result = _generate_image(
+        refine_prompt,
+        raw_refined_wang_source,
+        image_provider,
+        size="1600x960",
+        reference_paths=[hard_wang_source, normalized_seed, material_pair],
+        mask_path=boundary_mask,
+    )
+    _normalize_tilemap_wang_source(raw_refined_wang_source, normalized_refined_wang_source, tile_size)
+    _cleanup_boundary_refined_wang_source(normalized_refined_wang_source, hard_wang_source, boundary_mask, wang_source, tile_size)
+    masks = _compose_tileset_from_wang_source(wang_source, tileset, standard, tile_size)
+    _create_tilemap_preview(tileset, preview, tile_size, standard, masks)
+    rel_material_pair = _rel(project_root, material_pair)
+    rel_hard_wang_source = _rel(project_root, hard_wang_source)
+    rel_boundary_mask = _rel(project_root, boundary_mask)
+    rel_raw_refined_wang_source = _rel(project_root, raw_refined_wang_source)
+    rel_wang_source = _rel(project_root, wang_source)
+    rel_preview = _rel(project_root, preview)
+    extra_processing: dict[str, Any] = {
+        "source": "ai-materials-programmatic-wang-refined",
+        "sourceCleanup": "boundary-refine-mask-guided-wang",
+        "referencePurpose": "style-only",
+        "seedPath": rel_seed,
+        "materialPairPath": rel_material_pair,
+        "hardWangSourcePath": rel_hard_wang_source,
+        "boundaryMaskPath": rel_boundary_mask,
+        "aiRefinedWangSourcePath": rel_raw_refined_wang_source,
+        "wangSourcePath": rel_wang_source,
+        "previewPath": rel_preview,
+        "subject": subject,
+        "prompt": refine_prompt,
+        "materialPrompt": material_prompt,
+        "model": refine_result.model,
+        "materialModel": material_result.model,
+        "provider": image_provider,
+        "providerBaseUrl": refine_result.base_url or material_result.base_url,
+        "streamEvents": [*(material_result.stream_events or []), *(refine_result.stream_events or [])],
+        "referenceImages": [rel_seed, rel_material_pair, rel_hard_wang_source, rel_boundary_mask],
+        "assembly": "wang-5x3-half-quarter",
+        "terrainMaskBits": TILEMAP_TERRAIN_MASK_BITS,
+        "terrainMasks": masks,
+    }
+    extra_files = [
+        AssetFile(role="seed:tilemap-3x3", path=rel_seed),
+        AssetFile(role="source:tilemap:materials", path=rel_material_pair),
+        AssetFile(role="source:tilemap:wang-5x3-hard", path=rel_hard_wang_source),
+        AssetFile(role="mask:tilemap:wang-5x3-boundary", path=rel_boundary_mask),
+        AssetFile(role="source:tilemap:wang-5x3", path=rel_wang_source),
+        AssetFile(role=f"preview:tilemap:{standard}", path=rel_preview),
+    ]
+    if standard == "dual-grid-16":
+        return _create_tilemap_manifest(
+            project_root,
+            asset_name,
+            tileset,
+            tile_size,
+            style_id,
+            content_path,
+            standard="dual-grid-16",
+            tile_ids=TILEMAP_DUAL_GRID_16_IDS,
+            columns=4,
+            file_role="tileset:dual-grid-16",
+            label="dual-grid 16 terrain",
+            extra_processing={
+                **extra_processing,
+                "grid": "dual",
+                "maskBits": TILEMAP_DUAL_GRID_16_MASK_BITS,
+                "maskRange": [0, 15],
+                "maskOrder": "NW=1, NE=2, SW=4, SE=8",
+            },
+            extra_files=extra_files,
+        )
+    return _create_tilemap_manifest(
+        project_root,
+        asset_name,
+        tileset,
+        tile_size,
+        style_id,
+        content_path,
+        standard="47-tile",
+        tile_ids=TILEMAP_47_IDS,
+        columns=8,
+        file_role="tileset:47",
+        label="47-tile terrain",
+        extra_processing=extra_processing,
+        extra_files=extra_files,
     )
 
 

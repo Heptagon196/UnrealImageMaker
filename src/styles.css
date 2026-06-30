@@ -2489,6 +2489,25 @@ textarea {
   grid-column: span 3;
 }
 
+.advanced-toggle {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-soft);
+}
+
+.advanced-toggle button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.advanced-toggle button:hover {
+  text-decoration: underline;
+}
+
 .subpanel {
   display: grid;
   gap: var(--space-3);
