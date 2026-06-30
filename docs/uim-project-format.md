@@ -5,7 +5,6 @@
 ```text
 MyAssetProject.uim/
   project.uim.json
-  models.lock.json
   profiles/
   assets/
   exports/
@@ -21,15 +20,15 @@ MyAssetProject.uim/
 - `id`：项目 UUID。
 - `name`：项目显示名。
 - `default_style`：默认风格配置 ID。
-- `target_engines`：目标引擎列表，MVP 默认为 `["unreal"]`。
-- `model_cache`：模型缓存策略，MVP 固定为软件共享缓存。
+- `target_engines`：目标引擎列表，当前主要面向 `["unreal"]`。
+- `model_cache`：模型缓存策略；当前运行时使用软件共享缓存。
 - `settings`：扩展设置。
 
 ## `models.lock.json`
 
-锁定项目使用的模型信息，但不保存模型本体。
+可选文件，用于记录项目曾使用的模型信息，但不保存模型本体。
 
-另一台电脑打开项目时，软件根据 `models.lock.json` 检查本机 `model-cache`，缺失时提示下载同版本模型。
+当前正式工作流不依赖本地分割模型；如果项目存在 `models.lock.json`，运行时可以用它检查本机模型缓存是否缺失。
 
 字段：
 

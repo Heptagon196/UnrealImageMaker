@@ -1,6 +1,6 @@
 # Unreal 导出方案
 
-MVP 不直接手写 `.uasset`。
+项目不直接手写 `.uasset`。
 
 推荐流程：
 
@@ -18,4 +18,4 @@ UnrealImageMaker asset manifest
 
 ## 插件策略
 
-MVP 不做 UE 插件。后续插件只负责更好的编辑器入口、菜单、右键动作、Data Validation 和更深 Common UI / Paper2D 集成。
+当前不内置 UE 插件。后续插件只负责更好的编辑器入口、菜单、右键动作、Data Validation 和更深 Common UI / Paper2D 集成。
