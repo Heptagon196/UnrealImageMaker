@@ -11,9 +11,20 @@ def _runtime_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _default_workspace_root() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "UnrealImageMaker"
+    return Path.home() / ".unrealimagemaker"
+
+
 def _prepare_environment() -> None:
     root = _runtime_root()
     os.environ.setdefault("UIM_RUNTIME_ROOT", str(root))
+    if getattr(sys, "frozen", False):
+        workspace = _default_workspace_root()
+        workspace.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("UIM_WORKSPACE", str(workspace))
     os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
     os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 

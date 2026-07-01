@@ -1055,6 +1055,9 @@ def api_create_project(request: CreateProjectRequest) -> dict[str, Any]:
 def api_open_project(request: ProjectRequest) -> dict[str, Any]:
     root = Path(request.root)
     try:
+        project_file = root / PROJECT_FILE
+        if not project_file.exists():
+            raise FileNotFoundError(f"所选目录不是 UnrealImageMaker 项目，未找到 {project_file}。如果要新建项目，请切换到“创建”。")
         project = load_project(root)
         _remember_current_project(root)
         locked = load_models_lock(models_lock_path(root))

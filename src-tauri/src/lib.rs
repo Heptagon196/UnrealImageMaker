@@ -106,6 +106,12 @@ fn bundled_root(app: &tauri::AppHandle) -> Option<PathBuf> {
     app.path().resource_dir().ok()
 }
 
+fn app_data_root(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = app.path().app_data_dir().ok()?;
+    let _ = fs::create_dir_all(&path);
+    Some(path)
+}
+
 fn first_existing(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     paths.into_iter().find(|path| path.exists())
 }
@@ -152,10 +158,11 @@ fn sidecar_executable(resource_root: &Path) -> Option<PathBuf> {
     ])
 }
 
-fn sidecar_backend_runtime(resource_root: &Path) -> Option<BackendRuntime> {
+fn sidecar_backend_runtime(resource_root: &Path, data_root: Option<&Path>) -> Option<BackendRuntime> {
     let executable = sidecar_executable(resource_root)?;
-    let root = executable.parent().unwrap_or(resource_root).to_path_buf();
-    let support = root.join(SIDECAR_SUPPORT_DIR);
+    let runtime_root = executable.parent().unwrap_or(resource_root);
+    let root = data_root.map(Path::to_path_buf).unwrap_or_else(|| runtime_root.to_path_buf());
+    let support = runtime_root.join(SIDECAR_SUPPORT_DIR);
     Some(BackendRuntime {
         root,
         command: executable,
@@ -173,7 +180,8 @@ fn backend_runtime(app: &tauri::AppHandle) -> Option<BackendRuntime> {
         }
     }
     if let Some(resource_root) = bundled_root(app) {
-        if let Some(runtime) = sidecar_backend_runtime(&resource_root) {
+        let data_root = app_data_root(app);
+        if let Some(runtime) = sidecar_backend_runtime(&resource_root, data_root.as_deref()) {
             return Some(runtime);
         }
         if let Some(runtime) = legacy_resource_backend_runtime(&resource_root) {
@@ -212,19 +220,20 @@ fn start_backend(app: &tauri::AppHandle) -> Option<Child> {
     let runtime = backend_runtime(app)?;
     let root = runtime.root.clone();
     let (stdout_log, stderr_log) = backend_logs(&root);
-    let stdout = File::create(stdout_log).ok()?;
-    let stderr = File::create(stderr_log).ok()?;
+    let stdout = File::create(stdout_log).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
+    let stderr = File::create(stderr_log).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
 
     let mut command = Command::new(&runtime.command);
     command
+        .env("UIM_WORKSPACE", &root)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .current_dir(&root)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        .stdout(stdout)
+        .stderr(stderr);
     command.args(&runtime.args);
-    if let Some(backend) = runtime.backend.as_ref().filter(|path| path.exists()) {
+    if let Some(backend) = runtime.backend.as_ref().filter(|path| runtime.kind != "sidecar" && path.exists()) {
         command.env("PYTHONPATH", backend);
     }
 
