@@ -18,17 +18,17 @@ import {
 } from "lucide-react";
 import "./styles.css";
 import { AppContext } from "./AppContext";
+import ProjectSidebar from "./components/ProjectSidebar";
+import RightPanel from "./components/RightPanel";
+import GameUiPage from "./pages/GameUiPage";
 
 const PixelPage = lazy(() => import("./pages/PixelPage"));
-const GameUiPage = lazy(() => import("./pages/GameUiPage"));
+const AppDialogs = lazy(() => import("./dialogs/AppDialogs"));
+const AssetPreviewPanel = lazy(() => import("./components/AssetPreviewPanel"));
 const ModelsPage = lazy(() => import("./pages/ModelsPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 const AssetsPage = lazy(() => import("./pages/AssetsPage"));
 const ExportPage = lazy(() => import("./pages/ExportPage"));
-const ProjectSidebar = lazy(() => import("./components/ProjectSidebar"));
-const RightPanel = lazy(() => import("./components/RightPanel"));
-const AssetPreviewPanel = lazy(() => import("./components/AssetPreviewPanel"));
-const AppDialogs = lazy(() => import("./dialogs/AppDialogs"));
 
 const API_BASE = "http://127.0.0.1:8765";
 const EXPECTED_API_CONTRACT_VERSION = "uim-api-2026-06-29-ui-import-assets";
@@ -274,6 +274,7 @@ type RuntimeSettings = {
   openAiBaseUrl: string;
   openAiMergeEditImages: boolean;
   unrealMcpUrl: string;
+  unrealEditorPath: string;
   hasHuggingFaceToken: boolean;
   networkProxy: string;
   codexOAuth: CodexOAuthStatus;
@@ -596,6 +597,9 @@ type ProjectWorkspaceResponse = {
   processingQueue?: unknown[];
   workflowSlots: WorkflowSlots;
   mcpUiState?: McpUiState;
+  gameUiSettings?: {
+    unrealProjectPath?: string;
+  };
 };
 
 type McpUiState = {
@@ -692,23 +696,39 @@ async function startBackendWorker(): Promise<BackendWorkerStatus | null> {
   }
 }
 
+async function fetchBackendHealth(): Promise<HealthResponse | null> {
+  try {
+    const response = await fetch(`${API_BASE}/health`, { cache: "no-store" });
+    if (!response.ok) return null;
+    return (await response.json()) as HealthResponse;
+  } catch (error) {
+    lastBackendStartStatus = {
+      ...(lastBackendStartStatus ?? { online: false }),
+      online: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+    return null;
+  }
+}
+
+function isExpectedBackendHealth(health: HealthResponse | null) {
+  return Boolean(
+    health &&
+      health.status === "ok" &&
+      health.apiContractVersion === EXPECTED_API_CONTRACT_VERSION &&
+      health.capabilities?.codexOAuthCallback === "fixed-loopback-manual-fallback" &&
+      health.capabilities?.openAiBaseUrl === true &&
+      health.capabilities?.bundledVideoFfmpeg === true &&
+      health.capabilities?.videoThumbnails === true &&
+      health.capabilities?.gameUiMcp === true
+  );
+}
+
 async function waitForBackendHealth(timeoutMs = 6000) {
   const deadline = Date.now() + timeoutMs;
-  let lastError = "";
   while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${API_BASE}/health`);
-      if (response.ok) {
-        const health = (await response.json()) as HealthResponse;
-        if (health.status === "ok" && health.apiContractVersion === EXPECTED_API_CONTRACT_VERSION) return true;
-      }
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
+    if (isExpectedBackendHealth(await fetchBackendHealth())) return true;
     await new Promise((resolve) => window.setTimeout(resolve, 300));
-  }
-  if (lastError) {
-    lastBackendStartStatus = { ...(lastBackendStartStatus ?? { online: false }), online: false, error: lastError };
   }
   return false;
 }
@@ -1067,6 +1087,7 @@ function App() {
   const workspaceRefreshRequestRef = useRef(0);
   const [gameUiPreviewCanvasWidth, setGameUiPreviewCanvasWidth] = useState(0);
   const [previewHeight, setPreviewHeight] = useState(360);
+  const [assetPreviewReady, setAssetPreviewReady] = useState(false);
   const previewResizeRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null);
   const [activePreviewVersionId, setActivePreviewVersionId] = useState<string | null>(null);
   const [activePreviewPath, setActivePreviewPath] = useState("");
@@ -1083,6 +1104,8 @@ function App() {
   const [openAiMergeEditImagesDraft, setOpenAiMergeEditImagesDraft] = useState(true);
   const [huggingFaceTokenDraft, setHuggingFaceTokenDraft] = useState("");
   const [unrealMcpUrlDraft, setUnrealMcpUrlDraft] = useState("");
+  const [unrealEditorPathDraft, setUnrealEditorPathDraft] = useState("");
+  const [unrealProjectPathDraft, setUnrealProjectPathDraft] = useState("");
   const [networkProxyDraft, setNetworkProxyDraft] = useState("");
   const [seedanceKeyDraft, setSeedanceKeyDraft] = useState("");
   const [seedanceEndpointDraft, setSeedanceEndpointDraft] = useState("");
@@ -1554,6 +1577,7 @@ function App() {
     const result = await api<ProjectWorkspaceResponse>(`/projects/workspace?${new URLSearchParams({ project_root: normalizedRoot }).toString()}`);
     if (requestId === workspaceRefreshRequestRef.current && normalizeProjectRootInput(projectRootRef.current) === normalizedRoot) {
       setWorkflowSlots(result.workflowSlots && typeof result.workflowSlots === "object" ? result.workflowSlots : {});
+      setUnrealProjectPathDraft(result.gameUiSettings?.unrealProjectPath || "");
       applyMcpUiState(result.mcpUiState);
     }
   }
@@ -1641,6 +1665,20 @@ function App() {
       method: "PUT",
       body: JSON.stringify({ project_root: projectRoot, workflow_slots: nextSlots })
     });
+  }
+
+  async function saveGameUiUnrealProjectPath(path: string) {
+    const nextPath = path.trim();
+    setUnrealProjectPathDraft(nextPath);
+    if (!projectRoot.trim()) return;
+    const result = await api<ProjectWorkspaceResponse>("/projects/workspace/game-ui-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        project_root: projectRoot,
+        game_ui_settings: { unrealProjectPath: nextPath }
+      })
+    });
+    setUnrealProjectPathDraft(result.gameUiSettings?.unrealProjectPath || nextPath);
   }
 
   async function setWorkflowSlot(group: WorkflowSlotGroup, key: string, value: WorkflowSlotValue) {
@@ -2274,21 +2312,14 @@ function App() {
   async function waitForBackend() {
     setBackend("checking");
     let restartedForVersionMismatch = false;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      try {
-        const health = await api<HealthResponse>("/health");
-        if (
-          health.status === "ok" &&
-          health.apiContractVersion === EXPECTED_API_CONTRACT_VERSION &&
-          health.capabilities?.codexOAuthCallback === "fixed-loopback-manual-fallback" &&
-          health.capabilities?.openAiBaseUrl === true &&
-          health.capabilities?.bundledVideoFfmpeg === true &&
-          health.capabilities?.videoThumbnails === true &&
-          health.capabilities?.gameUiMcp === true
-        ) {
-          setBackend("online");
-          return true;
-        }
+    let restartedForOffline = false;
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      const health = await fetchBackendHealth();
+      if (isExpectedBackendHealth(health)) {
+        setBackend("online");
+        return true;
+      }
+      if (health) {
         const actualVersion = health.apiContractVersion || "未提供";
         pushLog(`检测到本地服务版本不匹配：前端需要 ${EXPECTED_API_CONTRACT_VERSION}，后端是 ${actualVersion}`);
         if (!restartedForVersionMismatch) {
@@ -2299,14 +2330,14 @@ function App() {
           continue;
         }
         break;
-      } catch {
-        if (attempt === 2 || attempt === 10) {
-          const status = await startBackendWorker();
-          if (status) setWorkerStatus(status);
-          if (status?.error) pushLog(`后端自动启动失败：${status.error}`);
-        }
-        await new Promise((resolve) => window.setTimeout(resolve, 500));
       }
+      if (!restartedForOffline || attempt === 8) {
+        restartedForOffline = true;
+        const status = await startBackendWorker();
+        if (status) setWorkerStatus(status);
+        if (status?.error) pushLog(`后端自动启动失败：${status.error}`);
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 300));
     }
     const status = await tauriCommand<BackendWorkerStatus>("backend_worker_status");
     if (status) setWorkerStatus(status);
@@ -2327,6 +2358,7 @@ function App() {
     setOpenAiBaseUrlDraft(result.openAiBaseUrl || "https://api.openai.com/v1");
     setOpenAiMergeEditImagesDraft(result.openAiMergeEditImages !== false);
     setUnrealMcpUrlDraft(result.unrealMcpUrl);
+    setUnrealEditorPathDraft(result.unrealEditorPath || "");
     setNetworkProxyDraft(result.networkProxy || "");
     setSeedanceEndpointDraft(result.seedanceEndpoint || DEFAULT_SEEDANCE_ENDPOINT);
     setSeedanceModelDraft(normalizeSeedanceModel(result.seedanceModel) || DEFAULT_SEEDANCE_MODEL);
@@ -2346,6 +2378,7 @@ function App() {
             openai_base_url: openAiBaseUrlDraft,
             openai_merge_edit_images: openAiMergeEditImagesDraft,
             unreal_mcp_url: unrealMcpUrlDraft,
+            unreal_editor_path: unrealEditorPathDraft,
             huggingface_token: huggingFaceTokenDraft || null,
             network_proxy: networkProxyDraft,
             seedance_api_key: seedanceKeyDraft || null,
@@ -4773,7 +4806,7 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
       return;
     }
     await runAction(
-      "一键导出到 UE",
+      "导出 UE Python",
       () =>
         api<Record<string, unknown>>("/game-ui/export-umg", {
           method: "POST",
@@ -4782,22 +4815,84 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
             screen_name: gameUiScreenName,
             structure_path: gameUiStructurePath,
             texture_kit_path: selectedKit.path,
-            content_path: `${contentPath}/UI`
+            content_path: `${contentPath}/UI`,
+            execute_in_unreal: true,
+            unreal_project_path: unrealProjectPathDraft
           })
         }),
       (result) => {
         const widgetPath = typeof result.widgetPath === "string" ? result.widgetPath : "";
-        if (result.mode === "mcp") {
-          const mcp = result.mcp && typeof result.mcp === "object" ? (result.mcp as Record<string, unknown>) : {};
-          const count = typeof mcp.widgetCount === "number" ? `，控件 ${mcp.widgetCount} 个` : "";
-          pushLog(`已通过 MCP 写入 UE：${widgetPath}${count}`);
-          return;
-        }
         const script = typeof result.script === "string" ? result.script : "";
-        const error = typeof result.mcpError === "string" ? result.mcpError : "未连接到 UE MCP";
-        pushLog(`未写入 UE，已生成备用导入脚本：${script}；MCP：${error}`);
+        const execution = result.execution && typeof result.execution === "object" ? (result.execution as Record<string, unknown>) : null;
+        const logUnrealExecutionErrors = () => {
+          if (!execution) return;
+          const returnCode = typeof execution.returnCode === "number" ? execution.returnCode : null;
+          const scriptResult = execution.scriptResult && typeof execution.scriptResult === "object" ? JSON.stringify(execution.scriptResult) : "";
+          const detectedErrors = Array.isArray(execution.detectedErrors) ? execution.detectedErrors.map((item) => String(item)).filter(Boolean) : [];
+          if (returnCode !== null && returnCode !== 0) pushLog(`UE headless 退出码：${returnCode}`);
+          if (scriptResult) pushLog(`UE UMG 结果：${scriptResult}`);
+          if (detectedErrors.length > 0) {
+            pushLog(`UE headless 检测到错误：\n${detectedErrors.join("\n")}`);
+          } else {
+            pushLog("UE headless 未检测到明确错误行；请查看上面的 UMG 结果或导出的 Python 脚本。");
+          }
+        };
+        if (execution?.ok === true) {
+          pushLog(`已执行 UE Python 导入：${widgetPath}`);
+        } else if (execution) {
+          const error = typeof execution.error === "string" ? execution.error : "UE Python 执行失败，请查看 Unreal 日志";
+          pushLog(`已生成 UE Python 脚本：${script}；自动执行未完成：${error}`);
+          logUnrealExecutionErrors();
+        } else {
+          pushLog(`已生成 UE Python 导入脚本：${script}；目标 Widget：${widgetPath}`);
+        }
       }
     );
+  }
+
+  async function saveUnrealEditorPath(path: string) {
+    const nextPath = path.trim();
+    setUnrealEditorPathDraft(nextPath);
+    const result = await api<RuntimeSettings>("/settings/runtime", {
+      method: "POST",
+      body: JSON.stringify({ unreal_editor_path: nextPath })
+    });
+    setRuntimeSettings(result);
+    setUnrealEditorPathDraft(result.unrealEditorPath || nextPath);
+  }
+
+  async function chooseUnrealEditorPath() {
+    const selected = await openDialog({
+      multiple: false,
+      directory: false,
+      title: "选择 UnrealEditor-Cmd.exe 或 UnrealEditor.exe",
+      filters: [{ name: "Unreal Editor", extensions: ["exe"] }]
+    });
+    if (typeof selected === "string") {
+      try {
+        await saveUnrealEditorPath(selected);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        pushLog(`保存 Unreal Editor 路径失败：${message}`);
+      }
+    }
+  }
+
+  async function chooseUnrealProjectPath() {
+    const selected = await openDialog({
+      multiple: false,
+      directory: false,
+      title: "选择 Unreal .uproject",
+      filters: [{ name: "Unreal Project", extensions: ["uproject"] }]
+    });
+    if (typeof selected === "string") {
+      try {
+        await saveGameUiUnrealProjectPath(selected);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        pushLog(`保存 Unreal 项目路径失败：${message}`);
+      }
+    }
   }
 
   async function openGameUiSkinPreview() {
@@ -4949,6 +5044,14 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
 
   useEffect(() => {
     refreshMcpRuntimePaths().catch((error) => pushLog(error.message));
+    const previewTimer = window.setTimeout(() => setAssetPreviewReady(true), 0);
+    const preloadTimer = window.setTimeout(() => {
+      void import("./pages/ModelsPage");
+      void import("./pages/SettingsPage");
+      void import("./pages/AssetsPage");
+      void import("./pages/ExportPage");
+      void import("./dialogs/AppDialogs");
+    }, 2000);
     waitForBackend().then((online) => {
       if (online) {
         refreshModels().catch((error) => pushLog(error.message));
@@ -4956,6 +5059,10 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
         checkUnrealStatus().catch((error) => pushLog(error.message));
       }
     });
+    return () => {
+      window.clearTimeout(previewTimer);
+      window.clearTimeout(preloadTimer);
+    };
   }, []);
 
   useEffect(() => {
@@ -5255,8 +5362,21 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
 
   function AssetPreview(options: { overridePath?: string; overrideName?: string } = {}) {
     const PreviewPanel = AssetPreviewPanel as React.ComponentType<typeof options>;
+    if (!assetPreviewReady) {
+      return (
+        <section className="preview-panel preview-panel-loading" aria-label="资产预览加载中" style={{ height: previewHeight }}>
+          <div>正在加载资产预览</div>
+        </section>
+      );
+    }
     return (
-      <Suspense fallback={null}>
+      <Suspense
+        fallback={
+          <section className="preview-panel preview-panel-loading" aria-label="资产预览加载中" style={{ height: previewHeight }}>
+            <div>正在加载资产预览</div>
+          </section>
+        }
+      >
         <PreviewPanel {...options} />
       </Suspense>
     );
@@ -5692,6 +5812,8 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     bakeGameUiHtml,
     browserVersionDate,
     checkNetworkProxy,
+    chooseUnrealEditorPath,
+    chooseUnrealProjectPath,
     codexCallbackInput,
     codexFlow,
     codexOAuth,
@@ -5838,8 +5960,10 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     runAction,
     runPixelBatch,
     runtimeSettings,
+    saveGameUiUnrealProjectPath,
     saveGameUiHtml,
     saveRuntimeSettings,
+    saveUnrealEditorPath,
     seedanceEndpointDraft,
     seedanceKeyDraft,
     seedanceModelDraft,
@@ -5919,6 +6043,8 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     setUiGameDescription,
     setUiLayout,
     setUnrealMcpUrlDraft,
+    setUnrealEditorPathDraft,
+    setUnrealProjectPathDraft,
     startCodexOAuth,
     tilemapImportOpen,
     tilemapStandardOption,
@@ -5928,6 +6054,8 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
     uiGameDescription,
     uiLayout,
     unrealMcpUrlDraft,
+    unrealEditorPathDraft,
+    unrealProjectPathDraft,
     updatePixelAnchorOutputSize,
     updatePixelCellSize,
     updatePixelSeedanceModel,
@@ -5942,28 +6070,30 @@ No extra weapon swing, magic, fireball, spell effects, smoke, particles, glow, t
   return (
     <AppContext.Provider value={appContextValue}>
       <main className="app-shell">
-      <Suspense fallback={null}>
         <ProjectSidebar />
-      </Suspense>
       <section className="workbench-shell">
         {TopTabs()}
         <div className="workbench-body">
           <section className="main-workspace">
             {PageTitle()}
             <div className="workspace-scroll">
-              <Suspense fallback={null}>
+              <Suspense
+                fallback={
+                  <section className="workspace-loading-panel" aria-label="工作区加载中">
+                    <div>正在加载工作区</div>
+                  </section>
+                }
+              >
                 {MainPage()}
               </Suspense>
             </div>
           </section>
-          <Suspense fallback={null}>
             <RightPanel />
-          </Suspense>
         </div>
       </section>
-      <Suspense fallback={null}>
-        <AppDialogs />
-      </Suspense>
+        <Suspense fallback={null}>
+          <AppDialogs />
+        </Suspense>
       </main>
     </AppContext.Provider>
   );

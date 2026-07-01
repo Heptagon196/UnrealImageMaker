@@ -161,7 +161,15 @@ def load_project_workspace(root: Path) -> dict[str, Any]:
     mcp_ui_state = project.settings.get("mcpUiState")
     if not isinstance(mcp_ui_state, dict):
         mcp_ui_state = {}
-    return {"processingQueue": queue, "workflowSlots": slots, "mcpUiState": mcp_ui_state}
+    game_ui_settings = project.settings.get("gameUiSettings")
+    if not isinstance(game_ui_settings, dict):
+        game_ui_settings = {}
+    return {
+        "processingQueue": queue,
+        "workflowSlots": slots,
+        "mcpUiState": mcp_ui_state,
+        "gameUiSettings": game_ui_settings,
+    }
 
 
 def save_processing_queue(root: Path, queue: list[dict[str, Any]]) -> dict[str, Any]:
@@ -174,6 +182,16 @@ def save_processing_queue(root: Path, queue: list[dict[str, Any]]) -> dict[str, 
 def save_workflow_slots(root: Path, slots: dict[str, Any]) -> dict[str, Any]:
     project = load_project(root)
     project.settings["workflowSlots"] = slots
+    save_project(root, project)
+    return load_project_workspace(root)
+
+
+def save_game_ui_settings(root: Path, settings: dict[str, Any]) -> dict[str, Any]:
+    project = load_project(root)
+    current = project.settings.get("gameUiSettings")
+    if not isinstance(current, dict):
+        current = {}
+    project.settings["gameUiSettings"] = {**current, **settings}
     save_project(root, project)
     return load_project_workspace(root)
 

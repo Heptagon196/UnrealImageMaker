@@ -2040,15 +2040,41 @@ def _python_literal(value: Any) -> str:
     return repr(value)
 
 
-def _unreal_import_script(structure: dict[str, Any], kit: dict[str, Any], content_path: str, widget_path: str) -> str:
-    return f'''import unreal
+def _unreal_import_script(structure: dict[str, Any], kit: dict[str, Any], content_path: str, widget_path: str, result_path: str) -> str:
+    return f'''import asyncio
+import json
+import sys
+import traceback
+import unreal
+from toolset_registry._registry_interface import execute_tool as _execute_toolset
 
 STRUCTURE = {_python_literal(structure)}
 TEXTURE_KIT = {_python_literal(kit)}
 CONTENT_PATH = {content_path!r}
 WIDGET_PATH = {widget_path!r}
+RESULT_PATH = {result_path!r}
 DEFAULT_STYLE_TOKENS = {_python_literal(DEFAULT_STYLE_TOKENS)}
 BOX_STYLE_TOKENS = {_python_literal(sorted(BOX_STYLE_TOKENS))}
+
+def _write_uim_result(payload):
+    try:
+        with open(RESULT_PATH, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        unreal.log_error(f"UnrealImageMaker failed to write result file: {{exc}}")
+    unreal.log("UIM_RESULT " + json.dumps(payload, ensure_ascii=False))
+
+def _uim_excepthook(exc_type, exc_value, exc_tb):
+    error_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    _write_uim_result({{
+        "ok": False,
+        "widgetPath": WIDGET_PATH,
+        "error": str(exc_value),
+        "traceback": error_text,
+    }})
+    unreal.log_error("UnrealImageMaker UMG export failed: " + str(exc_value))
+
+sys.excepthook = _uim_excepthook
 
 def _color(hex_value, fallback=(1, 1, 1, 1)):
     if not hex_value or not isinstance(hex_value, str) or not hex_value.startswith("#"):
@@ -2129,7 +2155,16 @@ def _brush_from_texture(texture, width=64, height=64, draw_as="image", margin=0.
     brush = unreal.SlateBrush()
     try:
         brush.set_editor_property("resource_object", texture)
-        brush.set_editor_property("image_size", unreal.Vector2D(float(width), float(height)))
+        try:
+            image_size = unreal.DeprecateSlateVector2D()
+            image_size.set_editor_property("x", float(width))
+            image_size.set_editor_property("y", float(height))
+        except Exception:
+            try:
+                image_size = unreal.Vector2f(float(width), float(height))
+            except Exception:
+                image_size = unreal.Vector2D(float(width), float(height))
+        brush.set_editor_property("image_size", image_size)
         if draw_as == "box":
             brush.set_editor_property("draw_as", unreal.SlateBrushDrawType.BOX)
             brush.set_editor_property("margin", unreal.Margin(float(margin), float(margin), float(margin), float(margin)))
@@ -2182,38 +2217,114 @@ def _apply_button_style(button, node):
     except Exception as exc:
         unreal.log_warning(f"Button style setup failed for {{node.get('name')}}: {{exc}}")
 
-asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-factory = unreal.WidgetBlueprintFactory()
-try:
-    factory.set_editor_property("parent_class", unreal.UserWidget)
-except Exception:
-    pass
 package_path, asset_name = WIDGET_PATH.rsplit("/", 1)
-widget_bp = asset_tools.create_asset(asset_name, package_path, None, factory)
+asset_exists_before_create = unreal.EditorAssetLibrary.does_asset_exist(WIDGET_PATH)
+widget_bp = unreal.load_asset(WIDGET_PATH) if asset_exists_before_create else None
+if asset_exists_before_create:
+    if widget_bp:
+        existing_class = widget_bp.get_class().get_name()
+        if existing_class != "WidgetBlueprint":
+            raise RuntimeError(f"Existing asset at {{WIDGET_PATH}} is {{existing_class}}, expected WidgetBlueprint")
+    if not unreal.EditorAssetLibrary.delete_asset(WIDGET_PATH):
+        raise RuntimeError("Failed to replace existing Widget Blueprint: " + WIDGET_PATH)
+    try:
+        unreal.SystemLibrary.collect_garbage()
+    except Exception:
+        pass
+    widget_bp = None
+def _toolset_call(tool_name, payload):
+    return asyncio.run(_execute_toolset("UMGToolSet.UMGToolSet", tool_name, payload))
+
+def _class_ref(widget_class):
+    try:
+        return {{"refPath": widget_class.static_class().get_path_name()}}
+    except Exception:
+        pass
+    name = getattr(widget_class, "__name__", str(widget_class))
+    if name.startswith("unreal."):
+        name = name.split(".", 1)[1]
+    return {{"refPath": "/Script/UMG." + name}}
+
+def _object_ref(obj):
+    if not obj or obj == "None":
+        return None
+    if isinstance(obj, dict):
+        return obj
+    return {{"refPath": obj.get_path_name()}}
+
+def _load_ref(ref):
+    if not ref or ref == "None":
+        return None
+    ref_path = ref.get("refPath") if isinstance(ref, dict) else str(ref)
+    if not ref_path or ref_path == "None":
+        return None
+    return unreal.load_object(None, ref_path)
+
+if not getattr(unreal, "ToolsetRegistry", None) or not unreal.ToolsetRegistry.is_toolset_registered("UMGToolSet.UMGToolSet"):
+    raise RuntimeError("UMGToolSet.UMGToolSet is unavailable. UE 5.8 ToolsetRegistry/UMGToolSet plugins are required for headless Widget Blueprint export.")
+created = _toolset_call("CreateWidgetBlueprint", {{
+    "folderPath": package_path,
+    "assetName": asset_name,
+    "parentClass": {{"refPath": "/Script/UMG.UserWidget"}},
+}})
+widget_bp = _load_ref((created.get("returnValue") or {{}}))
 if not widget_bp:
     widget_bp = unreal.load_asset(WIDGET_PATH)
 if not widget_bp:
-    raise RuntimeError("Failed to create or load Widget Blueprint: " + WIDGET_PATH)
+    raise RuntimeError("Failed to create Widget Blueprint through UMGToolSet.UMGToolSet: " + WIDGET_PATH)
+if widget_bp.get_class().get_name() != "WidgetBlueprint":
+    raise RuntimeError(f"Created asset at {{WIDGET_PATH}} is {{widget_bp.get_class().get_name()}}, expected WidgetBlueprint")
+
+def _struct_value(data, *names):
+    if isinstance(data, dict):
+        for name in names:
+            if name in data:
+                return data[name]
+            lower_name = name[:1].lower() + name[1:]
+            if lower_name in data:
+                return data[lower_name]
+        return None
+    for name in names:
+        try:
+            return data.get_editor_property(name)
+        except Exception:
+            pass
+        try:
+            return getattr(data, name)
+        except Exception:
+            pass
+    return None
+
+def _add_widget(widget_class, name, parent=None):
+    payload = {{
+        "widgetBlueprint": _object_ref(widget_bp),
+        "widgetClass": _class_ref(widget_class),
+        "widgetDisplayName": str(name),
+        "childIndex": -1,
+    }}
+    parent_ref = _object_ref(parent)
+    if parent_ref:
+        payload["parentWidget"] = parent_ref
+    result = _toolset_call("AddWidget", payload)
+    info = result.get("returnValue") or {{}}
+    widget = _load_ref(_struct_value(info, "Widget", "widget"))
+    slot = _load_ref(_struct_value(info, "Slot", "slot"))
+    if not widget:
+        raise RuntimeError(f"UMGToolSet failed to add widget {{name}}")
+    return widget, slot
+
+root_canvas, root_slot = _add_widget(unreal.CanvasPanel, "RootCanvas", None)
 
 def _widget_tree(widget_blueprint):
-    tree = getattr(widget_blueprint, "widget_tree", None)
-    if tree:
-        return tree
-    generated_class = getattr(widget_blueprint, "generated_class", None)
-    if generated_class:
-        default_object = generated_class.get_default_object()
-        tree = getattr(default_object, "widget_tree", None)
+    try:
+        tree = unreal.find_object(widget_blueprint, "WidgetTree")
         if tree:
             return tree
-    try:
-        return widget_blueprint.get_editor_property("widget_tree")
     except Exception:
         pass
-    raise RuntimeError("Widget Blueprint has no accessible widget_tree: " + WIDGET_PATH)
+    return None
 
 tree = _widget_tree(widget_bp)
-root_canvas = tree.construct_widget(unreal.CanvasPanel, "RootCanvas")
-tree.root_widget = root_canvas
 
 def _dict_value(data, key, fallback):
     return data.get(key, fallback) if isinstance(data, dict) else fallback
@@ -2230,8 +2341,14 @@ def _make_anchors(min_x, min_y, max_x, max_y):
             pass
         return anchors
 
-def _slot(widget, node):
-    slot = widget.slot
+def _slot(widget, node, slot=None):
+    if slot is None:
+        try:
+            slot = widget.slot
+        except Exception:
+            slot = None
+    if not slot:
+        return
     anchors = node.get("anchors") if isinstance(node.get("anchors"), dict) else {{}}
     anchor_min = _dict_value(anchors, "minimum", {{}})
     anchor_max = _dict_value(anchors, "maximum", {{}})
@@ -2290,53 +2407,47 @@ def _apply_texture(widget, node, state="normal"):
 
 def _skin_background(parent, node, token=None, state="normal", suffix="Skin"):
     texture = _texture_for(node, state, explicit_token=token)
-    if not texture or not hasattr(parent, "add_child"):
+    if not texture:
         return None
-    skin = tree.construct_widget(unreal.Image, str(node.get("name", "Widget")) + suffix)
-    parent.add_child(skin)
+    skin, skin_slot = _add_widget(unreal.Image, str(node.get("name", "Widget")) + suffix, parent)
     try:
         brush = _brush_from_texture(texture, node.get("width", 64), node.get("height", 64), draw_as=_draw_as_for_token(token or _style_token(node)))
         _apply_brush(skin, brush, texture)
     except Exception:
         pass
-    _slot(skin, node)
+    _slot(skin, node, skin_slot)
     return skin
 
 def _create(parent, node):
     node_type = node.get("type", "panel")
     name = node.get("name", "Widget")
+    slot = None
     if node_type == "screen":
         widget = parent
     elif node_type in ("panel", "image"):
-        widget = tree.construct_widget(unreal.Image, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.Image, name, parent)
         _apply_texture(widget, node)
     elif node_type == "text":
         if node.get("styleToken"):
             _skin_background(parent, node, token=_style_token(node, "text"), suffix="Plate")
-        widget = tree.construct_widget(unreal.TextBlock, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.TextBlock, name, parent)
         _set_text(widget, node)
     elif node_type == "button":
-        widget = tree.construct_widget(unreal.Button, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.Button, name, parent)
         _apply_button_style(widget, node)
     elif node_type == "input":
         _skin_background(parent, node, token=_style_token(node, "input"))
-        widget = tree.construct_widget(unreal.EditableTextBox, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.EditableTextBox, name, parent)
         try:
             widget.set_text(str(node.get("text", "")))
         except Exception:
             pass
     elif node_type == "scroll":
         _skin_background(parent, node, token="scrollTrack")
-        widget = tree.construct_widget(unreal.ScrollBox, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.ScrollBox, name, parent)
     elif node_type == "checkbox":
         _skin_background(parent, node, token="checkboxBox", state="checked" if node.get("checked") else "unchecked")
-        widget = tree.construct_widget(unreal.CheckBox, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.CheckBox, name, parent)
         try:
             widget.set_is_checked(bool(node.get("checked")))
         except Exception:
@@ -2345,8 +2456,7 @@ def _create(parent, node):
         _skin_background(parent, node, token="sliderTrack")
         _skin_background(parent, node, token="sliderFill", suffix="Fill")
         _skin_background(parent, node, token="sliderThumb", suffix="Thumb")
-        widget = tree.construct_widget(unreal.Slider, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.Slider, name, parent)
         try:
             widget.set_value(float(node.get("value", 0.5)))
         except Exception:
@@ -2354,26 +2464,53 @@ def _create(parent, node):
     elif node_type == "dropdown":
         _skin_background(parent, node, token="dropdownBox")
         _skin_background(parent, node, token="dropdownArrow", suffix="Arrow")
-        widget = tree.construct_widget(unreal.ComboBoxString, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.ComboBoxString, name, parent)
         for option in node.get("options", []):
             try:
                 widget.add_option(str(option))
             except Exception:
                 pass
     else:
-        widget = tree.construct_widget(unreal.Image, name)
-        parent.add_child(widget)
+        widget, slot = _add_widget(unreal.Image, name, parent)
     if widget is not parent:
-        _slot(widget, node)
+        _slot(widget, node, slot)
     for child in node.get("children", []):
         child_parent = widget if node_type in ("screen", "scroll") and hasattr(widget, "add_child") else parent
         _create(child_parent, child)
     return widget
 
 _create(root_canvas, STRUCTURE["root"])
-unreal.EditorAssetLibrary.save_asset(WIDGET_PATH)
-unreal.EditorAssetLibrary.save_directory(package_path, only_if_is_dirty=False, recursive=True)
+try:
+    widget_bp.modify()
+except Exception:
+    pass
+try:
+    widget_bp.mark_package_dirty()
+except Exception:
+    pass
+try:
+    unreal.BlueprintEditorLibrary.compile_blueprint(widget_bp)
+except Exception as exc:
+    unreal.log_warning(f"Widget Blueprint compile failed for {{WIDGET_PATH}}: {{exc}}")
+try:
+    unreal.EditorAssetLibrary.save_loaded_asset(widget_bp, only_if_is_dirty=False)
+except Exception:
+    unreal.EditorAssetLibrary.save_asset(WIDGET_PATH, only_if_is_dirty=False)
+saved_widget = unreal.load_asset(WIDGET_PATH)
+saved_class = saved_widget.get_class().get_name() if saved_widget else ""
+exists = unreal.EditorAssetLibrary.does_asset_exist(WIDGET_PATH)
+if not exists or not saved_widget:
+    raise RuntimeError("Widget Blueprint was not saved: " + WIDGET_PATH)
+if saved_class != "WidgetBlueprint":
+    raise RuntimeError(f"Saved asset at {{WIDGET_PATH}} is {{saved_class}}, expected WidgetBlueprint")
+_write_uim_result({{
+    "ok": True,
+    "widgetPath": WIDGET_PATH,
+    "assetName": asset_name,
+    "packagePath": package_path,
+    "assetClass": saved_class,
+    "exists": bool(exists),
+}})
 unreal.log("UnrealImageMaker UMG export complete: " + WIDGET_PATH)
 '''
 
@@ -2403,33 +2540,187 @@ def export_game_ui_umg(project_root: Path, screen_name: str, structure_path: str
     asset_name = _safe_name(screen_name)
     widget_path = f"{content_path.rstrip('/')}/WBP_{asset_name}"
     output = root / "exports" / "unreal" / f"{asset_name}_umg_import.py"
+    result_output = root / "exports" / "unreal" / f"{asset_name}_umg_import_result.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(_unreal_import_script(structure, exported_kit, content_path, widget_path), encoding="utf-8", newline="\n")
-    try:
-        from .unreal.mcp_bridge import UnrealMcpBridge
+    output.write_text(_unreal_import_script(structure, exported_kit, content_path, widget_path, str(result_output)), encoding="utf-8", newline="\n")
+    return {
+        "mode": "python_script",
+        "script": str(output),
+        "resultFile": str(result_output),
+        "widgetPath": widget_path,
+        "validation": validation,
+        "runInUnreal": "Enable the Python Editor Script Plugin, then run this script from Unreal Editor's Python console or command line.",
+    }
 
-        mcp_result = UnrealMcpBridge().export_widget_blueprint(
-            widget_path,
-            structure,
-            texture_kit=exported_kit,
-            default_style_tokens=DEFAULT_STYLE_TOKENS,
-            box_style_tokens=BOX_STYLE_TOKENS,
-        )
+
+def _resolve_unreal_cmd_editor(editor_path: str) -> Path:
+    editor = Path(editor_path).expanduser().resolve()
+    if not editor.exists() or not editor.is_file():
+        raise ValueError(f"Unreal Editor executable does not exist: {editor_path}")
+    name = editor.name.lower()
+    if name == "unrealeditor.exe":
+        cmd_editor = editor.with_name("UnrealEditor-Cmd.exe")
+        if cmd_editor.exists() and cmd_editor.is_file():
+            return cmd_editor.resolve()
+        raise ValueError("Headless UMG export requires UnrealEditor-Cmd.exe. The selected path points to UnrealEditor.exe, and UnrealEditor-Cmd.exe was not found next to it.")
+    if name != "unrealeditor-cmd.exe":
+        raise ValueError("Headless UMG export requires selecting UnrealEditor-Cmd.exe, not the GUI UnrealEditor executable.")
+    return editor
+
+
+def _extract_unreal_error_lines(stdout: str, stderr: str, limit: int = 40) -> list[str]:
+    markers = (
+        "error",
+        "exception",
+        "traceback",
+        "runtimeerror",
+        "fatal",
+        "failed",
+        "失败",
+        "错误",
+    )
+    ignored = (
+        "LogEOSSDK",
+        "LogEOSShared",
+        "LogExit",
+        "LogHttpServerModule",
+        "Failed to load 'aqProf.dll'",
+        "Failed to load 'VtuneApi.dll'",
+        "Failed to load 'VtuneApi32e.dll'",
+        "Failed to load 'WinPixGpuCapturer.dll'",
+        "Failed to load 'Wintab32.dll'",
+        "PIX capture plugin failed to initialize",
+        "Failed to SetupSDK for platform",
+        "UE::UnifiedErrorTest",
+        "FError that has been invalidated",
+        "FError that has been moved from",
+        "LogAutomationTest: Error: Condition failed",
+        "HttpListener unable to bind",
+        "MapCheck:",
+        "LogInterchangeEngine:",
+        "LogFileHelpers: Saving Package:",
+        "OBJ SavePackage:",
+        "Cmd: OBJ SAVEPACKAGE",
+        "LogSavePackage: Moving",
+        "AssetCheck:",
+        "LogContentValidation:",
+    )
+    lines: list[str] = []
+    for source_name, text in (("stdout", stdout or ""), ("stderr", stderr or "")):
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            lowered = line.lower()
+            if any(skip in line for skip in ignored):
+                continue
+            if any(marker in lowered for marker in markers):
+                lines.append(f"{source_name}: {line}")
+    seen: set[str] = set()
+    unique = []
+    for line in lines:
+        if line in seen:
+            continue
+        seen.add(line)
+        unique.append(line)
+    return unique[-limit:]
+
+
+def _run_unreal_python_script(editor_path: str, project_path: str, script_path: Path, result_path: Path | None = None, timeout_seconds: int = 1800) -> dict[str, Any]:
+    editor = _resolve_unreal_cmd_editor(editor_path)
+    project = Path(project_path).expanduser().resolve()
+    if not project.exists() or not project.is_file() or project.suffix.lower() != ".uproject":
+        raise ValueError(f"Unreal project file does not exist: {project_path}")
+    if result_path and result_path.exists():
+        result_path.unlink()
+    args = [
+        str(editor),
+        str(project),
+        f"-ExecutePythonScript={script_path.resolve()}",
+        "-unattended",
+        "-nop4",
+        "-nullrhi",
+        "-nosplash",
+        "-NoSound",
+        "-NoLoadingScreen",
+        "-stdout",
+        "-FullStdOutLogOutput",
+    ]
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_seconds, check=False)
+    detected_errors = _extract_unreal_error_lines(result.stdout, result.stderr)
+    script_result: dict[str, Any] | None = None
+    result_error = ""
+    if result_path:
+        if result_path.exists():
+            try:
+                script_result = read_json(result_path)
+            except Exception as exc:
+                result_error = f"Failed to read Unreal export result file: {exc}"
+        else:
+            result_error = f"Unreal export result file was not written: {result_path}"
+    script_ok = bool(script_result.get("ok")) if isinstance(script_result, dict) else False
+    ok = result.returncode == 0 and (script_ok if result_path else True)
+    return {
+        "ok": ok,
+        "returnCode": result.returncode,
+        "command": args,
+        "stdout": result.stdout[-8000:],
+        "stderr": result.stderr[-8000:],
+        "detectedErrors": detected_errors,
+        "scriptResult": script_result,
+        "error": "" if ok else (result_error or (script_result.get("error") if isinstance(script_result, dict) else "") or "Unreal Python script did not report a successful UMG export."),
+    }
+
+
+def export_game_ui_umg_and_maybe_run(
+    project_root: Path,
+    screen_name: str,
+    structure_path: str,
+    texture_kit_path: str,
+    content_path: str = "/Game/UIM/UI",
+    *,
+    execute_in_unreal: bool = False,
+    unreal_editor_path: str = "",
+    unreal_project_path: str = "",
+) -> dict[str, Any]:
+    result = export_game_ui_umg(project_root, screen_name, structure_path, texture_kit_path, content_path)
+    if not execute_in_unreal:
+        return result
+    if not unreal_editor_path.strip() or not unreal_project_path.strip():
         return {
-            "mode": "mcp",
-            "script": str(output),
-            "widgetPath": widget_path,
-            "validation": validation,
-            "mcp": mcp_result,
+            **result,
+            "mode": "python_script",
+            "execution": {
+                "ok": False,
+                "configured": False,
+                "error": "Unreal Editor path and .uproject path are required to execute the script automatically.",
+            },
         }
+    try:
+        execution = _run_unreal_python_script(
+            unreal_editor_path,
+            unreal_project_path,
+            Path(str(result["script"])),
+            Path(str(result.get("resultFile") or "")) if result.get("resultFile") else None,
+        )
     except Exception as exc:
         return {
+            **result,
             "mode": "python_script",
-            "script": str(output),
-            "widgetPath": widget_path,
-            "validation": validation,
-            "mcpError": str(exc),
+            "execution": {
+                "ok": False,
+                "configured": True,
+                "error": str(exc),
+            },
         }
+    return {
+        **result,
+        "mode": "executed" if execution.get("ok") else "python_script",
+        "execution": {
+            "configured": True,
+            **execution,
+        },
+    }
 
 
 def generate_texture_kit(

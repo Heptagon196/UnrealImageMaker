@@ -50,7 +50,7 @@ from .game_ui import (
     clear_texture_kit,
     delete_game_ui_html,
     delete_game_ui_structure,
-    export_game_ui_umg,
+    export_game_ui_umg_and_maybe_run,
     game_ui_dsl_prompt,
     generate_texture_kit,
     list_game_ui_html_prototypes,
@@ -73,7 +73,16 @@ from .providers.codex_oauth_image import (
     refresh_codex_oauth_tokens,
     safe_token_status,
 )
-from .project import create_project, load_project, load_project_workspace, models_lock_path, save_current_project_root, save_processing_queue, save_workflow_slots
+from .project import (
+    create_project,
+    load_project,
+    load_project_workspace,
+    models_lock_path,
+    save_current_project_root,
+    save_game_ui_settings,
+    save_processing_queue,
+    save_workflow_slots,
+)
 from .providers.rembg_adapter import RembgAdapter
 from .providers.sam21_adapter import Sam21Adapter, SamPrompt
 from .providers.openai_image import DEFAULT_OPENAI_BASE_URL
@@ -394,6 +403,11 @@ class WorkflowSlotsRequest(BaseModel):
     workflow_slots: dict[str, Any]
 
 
+class GameUiSettingsRequest(BaseModel):
+    project_root: str
+    game_ui_settings: dict[str, Any]
+
+
 class SpriteAssetRequest(BaseModel):
     project_root: str
     prompt: str
@@ -434,6 +448,7 @@ class RuntimeSettingsRequest(BaseModel):
     openai_base_url: str | None = None
     openai_merge_edit_images: bool | None = None
     unreal_mcp_url: str | None = None
+    unreal_editor_path: str | None = None
     huggingface_token: str | None = None
     network_proxy: str | None = None
     seedance_api_key: str | None = None
@@ -736,6 +751,8 @@ class GameUiExportUmgRequest(BaseModel):
     structure_path: str
     texture_kit_path: str
     content_path: str = "/Game/UIM/UI"
+    execute_in_unreal: bool = False
+    unreal_project_path: str | None = None
 
 
 class GameUiTextureKitClearRequest(BaseModel):
@@ -784,6 +801,8 @@ def _apply_saved_runtime_settings() -> None:
         os.environ["OPENAI_MERGE_EDIT_IMAGES"] = "1" if bool(saved.get("openAiMergeEditImages")) else "0"
     if saved.get("unrealMcpUrl") and not os.environ.get("UIM_UNREAL_MCP_URL"):
         os.environ["UIM_UNREAL_MCP_URL"] = str(saved["unrealMcpUrl"])
+    if saved.get("unrealEditorPath") and not os.environ.get("UIM_UNREAL_EDITOR_PATH"):
+        os.environ["UIM_UNREAL_EDITOR_PATH"] = str(saved["unrealEditorPath"])
     if saved.get("seedanceEndpoint") and not os.environ.get("UIM_SEEDANCE_ENDPOINT"):
         os.environ["UIM_SEEDANCE_ENDPOINT"] = str(saved["seedanceEndpoint"])
     if saved.get("seedanceModel") and not os.environ.get("UIM_SEEDANCE_MODEL"):
@@ -815,6 +834,7 @@ def _runtime_settings() -> dict[str, Any]:
         "openAiBaseUrl": os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
         "openAiMergeEditImages": os.environ.get("OPENAI_MERGE_EDIT_IMAGES", "1").strip().lower() not in {"0", "false", "no", "off"},
         "unrealMcpUrl": os.environ.get("UIM_UNREAL_MCP_URL", ""),
+        "unrealEditorPath": os.environ.get("UIM_UNREAL_EDITOR_PATH", ""),
         "hasHuggingFaceToken": bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")),
         "networkProxy": proxy,
         "codexOAuth": codex_oauth_status(),
@@ -902,6 +922,13 @@ def api_update_runtime_settings(request: RuntimeSettingsRequest) -> dict[str, An
         else:
             os.environ.pop("UIM_UNREAL_MCP_URL", None)
         _save_runtime_settings_patch({"unrealMcpUrl": value})
+    if request.unreal_editor_path is not None:
+        value = request.unreal_editor_path.strip()
+        if value:
+            os.environ["UIM_UNREAL_EDITOR_PATH"] = value
+        else:
+            os.environ.pop("UIM_UNREAL_EDITOR_PATH", None)
+        _save_runtime_settings_patch({"unrealEditorPath": value})
     if request.huggingface_token:
         os.environ["HF_TOKEN"] = request.huggingface_token
     if request.network_proxy is not None:
@@ -1125,6 +1152,11 @@ def api_update_processing_queue(request: ProcessingQueueRequest) -> dict[str, An
 @app.put("/projects/workspace/slots")
 def api_update_workflow_slots(request: WorkflowSlotsRequest) -> dict[str, Any]:
     return save_workflow_slots(Path(request.project_root), request.workflow_slots)
+
+
+@app.put("/projects/workspace/game-ui-settings")
+def api_update_game_ui_settings(request: GameUiSettingsRequest) -> dict[str, Any]:
+    return save_game_ui_settings(Path(request.project_root), request.game_ui_settings)
 
 
 @app.put("/assets/{asset_id}/settings")
@@ -1948,7 +1980,16 @@ def api_game_ui_clear_texture_kit(request: GameUiTextureKitClearRequest) -> dict
 @app.post("/game-ui/export-umg")
 def api_game_ui_export_umg(request: GameUiExportUmgRequest) -> dict[str, Any]:
     try:
-        return export_game_ui_umg(Path(request.project_root), request.screen_name, request.structure_path, request.texture_kit_path, request.content_path)
+        return export_game_ui_umg_and_maybe_run(
+            Path(request.project_root),
+            request.screen_name,
+            request.structure_path,
+            request.texture_kit_path,
+            request.content_path,
+            execute_in_unreal=request.execute_in_unreal,
+            unreal_editor_path=os.environ.get("UIM_UNREAL_EDITOR_PATH", ""),
+            unreal_project_path=request.unreal_project_path or "",
+        )
     except Exception as exc:
         _raise_bad_request("game-ui/export-umg", exc, project_root=request.project_root, screen_name=request.screen_name)
 

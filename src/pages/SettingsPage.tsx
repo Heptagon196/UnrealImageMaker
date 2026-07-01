@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React, { useEffect, useState } from "react";
 import { Command } from "cmdk";
-import { CheckCircle2, ClipboardCopy, ExternalLink, RefreshCw, Settings, Trash2 } from "lucide-react";
+import { CheckCircle2, ClipboardCopy, ExternalLink, FolderOpen, RefreshCw, Settings, Trash2 } from "lucide-react";
 import { useAppContext } from "../AppContext";
 
 export default function SettingsPage() {
@@ -13,6 +13,7 @@ export default function SettingsPage() {
     SEEDANCE_MODEL_OPTIONS,
     absoluteMcpRoot,
     checkNetworkProxy,
+    chooseUnrealEditorPath,
     codexCallbackInput,
     codexFlow,
     codexOAuth,
@@ -29,9 +30,11 @@ export default function SettingsPage() {
     openAiMergeEditImagesDraft,
     pixelMcpBackendPath,
     pixelMcpPythonPath,
+    pushLog,
     refreshCodexOAuth,
     runtimeSettings,
     saveRuntimeSettings,
+    saveUnrealEditorPath,
     seedanceEndpointDraft,
     seedanceKeyDraft,
     seedanceModelDraft,
@@ -47,7 +50,9 @@ export default function SettingsPage() {
     setSeedanceKeyDraft,
     setSeedanceResolutionDraft,
     setUnrealMcpUrlDraft,
+    setUnrealEditorPathDraft,
     startCodexOAuth,
+    unrealEditorPathDraft,
     unrealMcpUrlDraft,
     updateSeedanceModelDraft
   } = useAppContext();
@@ -57,8 +62,8 @@ export default function SettingsPage() {
       <div className="settings-grid">  
         <section className="detail-card">  
           <div className="section-kicker">运行设置</div>  
-          <label className="field checkbox-field">
-            <span>OpenAI 密钥</span>  
+          <label className="field">
+            <span>OpenAI 密钥</span>
             <input  
               type="password"  
               value={openAiKeyDraft}  
@@ -94,10 +99,27 @@ export default function SettingsPage() {
           <label className="field">
   
             <span>Unreal MCP 地址</span>
-            <input value={unrealMcpUrlDraft} onChange={(event) => setUnrealMcpUrlDraft(event.target.value)} placeholder="http://127.0.0.1:xxxx" />  
-          </label>  
+            <input value={unrealMcpUrlDraft} onChange={(event) => setUnrealMcpUrlDraft(event.target.value)} placeholder="http://127.0.0.1:xxxx" />
+            <small>旧版 UE 不需要 MCP；配置 Editor 后可在游戏 UI 导出页自动执行 Python。</small>
+          </label>
           <label className="field">  
-            <span>Hugging Face 令牌 / RMBG 2.0</span>  
+            <span>Unreal Editor</span>
+            <div className="inline-input-action">
+              <input
+                value={unrealEditorPathDraft}
+                onChange={(event) => setUnrealEditorPathDraft(event.target.value)}
+                onBlur={() => saveUnrealEditorPath(unrealEditorPathDraft).catch((error) => pushLog(`保存 Unreal Editor 路径失败：${error instanceof Error ? error.message : String(error)}`))}
+                placeholder="UnrealEditor-Cmd.exe 或 UnrealEditor.exe"
+              />
+              <button className="secondary-action icon-only" onClick={chooseUnrealEditorPath} disabled={disabled} type="button" aria-label="选择 Unreal Editor">
+                <FolderOpen size={15} />
+              </button>
+            </div>
+            <small>用于自动执行导出的 UE Python；推荐选择 UnrealEditor-Cmd.exe。</small>
+          </label>
+
+          <label className="field">
+            <span>Hugging Face 令牌 / RMBG 2.0</span>
             <input  
               type="password"  
               value={huggingFaceTokenDraft}  

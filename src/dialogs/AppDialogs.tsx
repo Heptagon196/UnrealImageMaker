@@ -70,7 +70,7 @@ function GameUiSkinPreviewDialog() {
           <div className="alert-dialog-actions">
             <AlertDialog.Cancel className="dialog-button secondary">关闭</AlertDialog.Cancel>
             <AlertDialog.Action className="dialog-button" onClick={exportGameUiUmg} disabled={!gameUiStructurePath || !gameUiSelectedKitPath}>
-              一键导出到 UE
+              导出 UE Python
             </AlertDialog.Action>
           </div>
         </AlertDialog.Content>

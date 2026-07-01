@@ -219,6 +219,16 @@ textarea:focus-visible {
   padding-right: 2px;
 }
 
+.workspace-loading-panel {
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  color: var(--ink-500);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 8px;
+}
+
 .brand-row {
   display: flex;
   align-items: center;
@@ -774,6 +784,35 @@ input,
 select {
   height: 38px;
   padding: 0 10px;
+}
+
+input[type="checkbox"] {
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.field:has(> input[type="checkbox"]) {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 10px;
+  row-gap: 4px;
+}
+
+.field:has(> input[type="checkbox"]) > input[type="checkbox"] {
+  justify-self: start;
+}
+
+.field:has(> input[type="checkbox"]) > span {
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.field:has(> input[type="checkbox"]) > small {
+  grid-column: 1 / -1;
 }
 
 textarea {
@@ -2031,6 +2070,17 @@ textarea {
   overflow: hidden;
 }
 
+.preview-panel-loading {
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: linear-gradient(135deg, #f8fafc, #eef2f7);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .preview-browser-layout {
   min-height: 0;
   display: grid;
@@ -2675,6 +2725,13 @@ textarea {
   min-width: 36px;
   padding: 0;
   justify-content: center;
+}
+
+.inline-input-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 8px;
+  align-items: center;
 }
 
 .pixel-matrix {

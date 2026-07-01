@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -24,12 +25,14 @@ from uim_core.game_ui import (
     _state_sheet_prompt,
     _ui_chroma_cutout,
     _ui_texture_quality_report,
+    _extract_unreal_error_lines,
     bake_game_ui_html,
     clear_texture_kit,
     delete_game_ui_html,
     delete_game_ui_structure,
     default_texture_catalog,
     export_game_ui_umg,
+    export_game_ui_umg_and_maybe_run,
     generate_texture_kit,
     game_ui_dsl_prompt,
     list_texture_kits,
@@ -651,19 +654,245 @@ class GameUiPipelineTests(unittest.TestCase):
             result = export_game_ui_umg(root, "shopScreen", structure["path"], kit["path"])
             script = Path(result["script"]).read_text(encoding="utf-8")
 
-            self.assertIn("WidgetBlueprintFactory", script)
+            self.assertEqual(result["mode"], "python_script")
+            self.assertIn("runInUnreal", result)
+            self.assertIn("resultFile", result)
+            self.assertIn("from toolset_registry._registry_interface import execute_tool as _execute_toolset", script)
+            self.assertIn("_toolset_call(\"CreateWidgetBlueprint\"", script)
+            self.assertIn("_toolset_call(\"AddWidget\", payload)", script)
+            self.assertIn("unreal.ToolsetRegistry.is_toolset_registered(\"UMGToolSet.UMGToolSet\")", script)
             self.assertIn(str((root / "ui/textures/button_normal.png").resolve()).replace("\\", "\\\\"), script)
             self.assertIn("/Game/UIM/UI/WBP_shopscreen", script)
             self.assertIn("ButtonStyle", script)
             self.assertIn("set_editor_property(\"widget_style\"", script)
             self.assertIn("SlateBrushDrawType.BOX", script)
             self.assertIn("set_editor_property(\"margin\"", script)
-            self.assertIn("factory.set_editor_property(\"parent_class\", unreal.UserWidget)", script)
-            self.assertIn("def _widget_tree(widget_blueprint):", script)
+            self.assertIn("root_canvas, root_slot = _add_widget(unreal.CanvasPanel, \"RootCanvas\", None)", script)
+            self.assertIn("UMGToolSet.UMGToolSet is unavailable", script)
+            self.assertIn("sys.excepthook = _uim_excepthook", script)
             self.assertIn('node_type in ("screen", "scroll")', script)
             self.assertIn("slot.set_anchors", script)
             self.assertIn("slot.set_offsets", script)
             self.assertIn("unreal.Margin", script)
+            self.assertIn("BlueprintEditorLibrary.compile_blueprint(widget_bp)", script)
+            self.assertIn("does_asset_exist(WIDGET_PATH)", script)
+            self.assertIn("UIM_RESULT", script)
+            self.assertIn('"assetClass": saved_class', script)
+
+    def test_extract_unreal_error_lines_filters_known_headless_noise(self) -> None:
+        stdout = "\n".join(
+            [
+                "LogWindows: Failed to load 'aqProf.dll' (GetLastError=126)",
+                "LogWindows: Failed to load 'Wintab32.dll' (GetLastError=126)",
+                "PixWinPlugin: PIX capture plugin failed to initialize! Check that the process is launched from PIX.",
+                "[0]LogTargetPlatformManager: Display: Failed to SetupSDK for platform 'Android'",
+                "[0]MapCheck: 地图检测完成：0个错误、0个警告、完成用时2.19毫秒。",
+                "[2]LogInterchangeEngine: Display: Interchange start importing source [C:/Demo/inputdefault_error.png]",
+                "[2]LogFileHelpers: Saving Package: /Game/UIM/UI/inputdefault_error",
+                "[2]OBJ SavePackage: Finished generating thumbnails for package [/Game/UIM/UI/inputdefault_error]",
+                "[2]Cmd: OBJ SAVEPACKAGE PACKAGE=\"/Game/UIM/UI/inputdefault_error\"",
+                "[2]LogSavePackage: Moving output files for package: /Game/UIM/UI/inputdefault_error",
+                "[3]AssetCheck: /Game/UIM/UI/inputdefault_error 正在验证资产",
+                "[0]LogTemp: Error test: UE::UnifiedErrorTest::Empty: [empty error]",
+                "[0]LogAutomationTest: Error: Condition failed",
+                "[2]LogPython: Error: Traceback (most recent call last):",
+                "[2]LogPython: Error: AttributeError: real export failure",
+            ]
+        )
+
+        lines = _extract_unreal_error_lines(stdout, "")
+
+        self.assertEqual(
+            lines,
+            [
+                "stdout: [2]LogPython: Error: Traceback (most recent call last):",
+                "stdout: [2]LogPython: Error: AttributeError: real export failure",
+            ],
+        )
+
+    def test_export_umg_execute_without_unreal_settings_returns_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Demo.uim"
+            create_project(root, "Demo")
+            html = root / "ui" / "html" / "shop_screen.html"
+            html.parent.mkdir(parents=True)
+            html.write_text(RESPONSIVE_SCREEN_HTML, encoding="utf-8")
+            with patch("uim_core.game_ui._bake_html_with_playwright", _fake_bake):
+                structure = bake_game_ui_html(root, "shopScreen", "ui/html/shop_screen.html")
+            files = [{"token": "primaryButton", "state": state, "path": f"ui/textures/button_{state}.png"} for state in ("normal", "hover", "pressed", "disabled")]
+            for file in files:
+                _touch_texture(root, str(file["path"]))
+            kit = register_texture_kit(root, "Default", files)
+
+            result = export_game_ui_umg_and_maybe_run(root, "shopScreen", structure["path"], kit["path"], execute_in_unreal=True)
+
+            self.assertEqual(result["mode"], "python_script")
+            self.assertTrue(Path(result["script"]).exists())
+            self.assertFalse(result["execution"]["ok"])
+            self.assertFalse(result["execution"]["configured"])
+
+    def test_export_umg_execute_uses_unreal_python_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Demo.uim"
+            create_project(root, "Demo")
+            html = root / "ui" / "html" / "shop_screen.html"
+            html.parent.mkdir(parents=True)
+            html.write_text(RESPONSIVE_SCREEN_HTML, encoding="utf-8")
+            with patch("uim_core.game_ui._bake_html_with_playwright", _fake_bake):
+                structure = bake_game_ui_html(root, "shopScreen", "ui/html/shop_screen.html")
+            files = [{"token": "primaryButton", "state": state, "path": f"ui/textures/button_{state}.png"} for state in ("normal", "hover", "pressed", "disabled")]
+            for file in files:
+                _touch_texture(root, str(file["path"]))
+            kit = register_texture_kit(root, "Default", files)
+            editor = root / "UnrealEditor-Cmd.exe"
+            editor.write_text("", encoding="utf-8")
+            project_file = root / "Demo.uproject"
+            project_file.write_text("{}", encoding="utf-8")
+
+            result_file = root / "exports" / "unreal" / "shopscreen_umg_import_result.json"
+
+            def _run_success(*args, **kwargs):
+                result_file.parent.mkdir(parents=True, exist_ok=True)
+                result_file.write_text(json.dumps({"ok": True, "widgetPath": "/Game/UIM/UI/WBP_shopscreen", "assetClass": "WidgetBlueprint", "exists": True}), encoding="utf-8")
+                completed = Mock()
+                completed.returncode = 0
+                completed.stdout = "ok"
+                completed.stderr = ""
+                return completed
+
+            with patch("uim_core.game_ui.subprocess.run", side_effect=_run_success) as run:
+                result = export_game_ui_umg_and_maybe_run(
+                    root,
+                    "shopScreen",
+                    structure["path"],
+                    kit["path"],
+                    execute_in_unreal=True,
+                    unreal_editor_path=str(editor),
+                    unreal_project_path=str(project_file),
+                )
+
+            self.assertEqual(result["mode"], "executed")
+            args = run.call_args.args[0]
+            self.assertEqual(args[0], str(editor.resolve()))
+            self.assertEqual(args[1], str(project_file.resolve()))
+            self.assertTrue(any(str(result["script"]) in arg for arg in args))
+            self.assertIn("-nullrhi", args)
+            self.assertIn("-nosplash", args)
+            self.assertTrue(result["execution"]["scriptResult"]["ok"])
+
+    def test_export_umg_execute_fails_when_unreal_does_not_write_result_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Demo.uim"
+            create_project(root, "Demo")
+            html = root / "ui" / "html" / "shop_screen.html"
+            html.parent.mkdir(parents=True)
+            html.write_text(RESPONSIVE_SCREEN_HTML, encoding="utf-8")
+            with patch("uim_core.game_ui._bake_html_with_playwright", _fake_bake):
+                structure = bake_game_ui_html(root, "shopScreen", "ui/html/shop_screen.html")
+            files = [{"token": "primaryButton", "state": state, "path": f"ui/textures/button_{state}.png"} for state in ("normal", "hover", "pressed", "disabled")]
+            for file in files:
+                _touch_texture(root, str(file["path"]))
+            kit = register_texture_kit(root, "Default", files)
+            editor = root / "UnrealEditor-Cmd.exe"
+            editor.write_text("", encoding="utf-8")
+            project_file = root / "Demo.uproject"
+            project_file.write_text("{}", encoding="utf-8")
+
+            with patch("uim_core.game_ui.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = "texture import succeeded"
+                run.return_value.stderr = ""
+                result = export_game_ui_umg_and_maybe_run(
+                    root,
+                    "shopScreen",
+                    structure["path"],
+                    kit["path"],
+                    execute_in_unreal=True,
+                    unreal_editor_path=str(editor),
+                    unreal_project_path=str(project_file),
+                )
+
+            self.assertEqual(result["mode"], "python_script")
+            self.assertFalse(result["execution"]["ok"])
+            self.assertIn("result file was not written", result["execution"]["error"])
+
+    def test_export_umg_execute_uses_cmd_sibling_for_gui_editor_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Demo.uim"
+            create_project(root, "Demo")
+            html = root / "ui" / "html" / "shop_screen.html"
+            html.parent.mkdir(parents=True)
+            html.write_text(RESPONSIVE_SCREEN_HTML, encoding="utf-8")
+            with patch("uim_core.game_ui._bake_html_with_playwright", _fake_bake):
+                structure = bake_game_ui_html(root, "shopScreen", "ui/html/shop_screen.html")
+            files = [{"token": "primaryButton", "state": state, "path": f"ui/textures/button_{state}.png"} for state in ("normal", "hover", "pressed", "disabled")]
+            for file in files:
+                _touch_texture(root, str(file["path"]))
+            kit = register_texture_kit(root, "Default", files)
+            editor = root / "UnrealEditor.exe"
+            editor.write_text("", encoding="utf-8")
+            cmd_editor = root / "UnrealEditor-Cmd.exe"
+            cmd_editor.write_text("", encoding="utf-8")
+            project_file = root / "Demo.uproject"
+            project_file.write_text("{}", encoding="utf-8")
+
+            result_file = root / "exports" / "unreal" / "shopscreen_umg_import_result.json"
+
+            def _run_success(*args, **kwargs):
+                result_file.parent.mkdir(parents=True, exist_ok=True)
+                result_file.write_text(json.dumps({"ok": True, "widgetPath": "/Game/UIM/UI/WBP_shopscreen", "assetClass": "WidgetBlueprint", "exists": True}), encoding="utf-8")
+                completed = Mock()
+                completed.returncode = 0
+                completed.stdout = "ok"
+                completed.stderr = ""
+                return completed
+
+            with patch("uim_core.game_ui.subprocess.run", side_effect=_run_success) as run:
+                result = export_game_ui_umg_and_maybe_run(
+                    root,
+                    "shopScreen",
+                    structure["path"],
+                    kit["path"],
+                    execute_in_unreal=True,
+                    unreal_editor_path=str(editor),
+                    unreal_project_path=str(project_file),
+                )
+
+            self.assertEqual(result["mode"], "executed")
+            args = run.call_args.args[0]
+            self.assertEqual(args[0], str(cmd_editor.resolve()))
+
+    def test_export_umg_execute_rejects_gui_editor_without_cmd_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Demo.uim"
+            create_project(root, "Demo")
+            html = root / "ui" / "html" / "shop_screen.html"
+            html.parent.mkdir(parents=True)
+            html.write_text(RESPONSIVE_SCREEN_HTML, encoding="utf-8")
+            with patch("uim_core.game_ui._bake_html_with_playwright", _fake_bake):
+                structure = bake_game_ui_html(root, "shopScreen", "ui/html/shop_screen.html")
+            files = [{"token": "primaryButton", "state": state, "path": f"ui/textures/button_{state}.png"} for state in ("normal", "hover", "pressed", "disabled")]
+            for file in files:
+                _touch_texture(root, str(file["path"]))
+            kit = register_texture_kit(root, "Default", files)
+            editor = root / "UnrealEditor.exe"
+            editor.write_text("", encoding="utf-8")
+            project_file = root / "Demo.uproject"
+            project_file.write_text("{}", encoding="utf-8")
+
+            result = export_game_ui_umg_and_maybe_run(
+                root,
+                "shopScreen",
+                structure["path"],
+                kit["path"],
+                execute_in_unreal=True,
+                unreal_editor_path=str(editor),
+                unreal_project_path=str(project_file),
+            )
+
+            self.assertEqual(result["mode"], "python_script")
+            self.assertFalse(result["execution"]["ok"])
+            self.assertIn("UnrealEditor-Cmd.exe", result["execution"]["error"])
 
     def test_texture_kit_rejects_missing_local_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1024,6 +1253,7 @@ class GameUiPipelineTests(unittest.TestCase):
             result = export_game_ui_umg(root, "shopScreen", structure["path"], kit["path"])
             script = Path(result["script"]).read_text(encoding="utf-8")
 
+            self.assertEqual(result["mode"], "python_script")
             self.assertIn('unreal.load_asset(unreal_path)', script)
             self.assertIn("/Game/UIM/UI/T_primary_normal", script)
 

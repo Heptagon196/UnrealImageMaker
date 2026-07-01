@@ -5,7 +5,19 @@ import http from "node:http";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
-const API_CONTRACT_VERSION = "uim-api-2026-06-28-game-ui-mcp";
+function readApiContractVersion() {
+  try {
+    const constantsPath = path.join(process.cwd(), "backend", "uim_core", "constants.py");
+    const text = fs.readFileSync(constantsPath, "utf8");
+    const match = text.match(/API_CONTRACT_VERSION\s*=\s*["']([^"']+)["']/);
+    if (match) return match[1];
+  } catch {
+    // Fall through to the last known contract so Vite can still start with a readable error path.
+  }
+  return "uim-api-2026-06-29-ui-import-assets";
+}
+
+const API_CONTRACT_VERSION = readApiContractVersion();
 const API_HEALTH_URL = "http://127.0.0.1:8765/health";
 
 let backendProcess = null;
