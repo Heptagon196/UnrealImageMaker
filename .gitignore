@@ -21,6 +21,8 @@ logs/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/.tauri/
+src-tauri/binaries/
+src-tauri/uim-backend-support/
 .codex_tmp/
 .codex_tmp_*
 .codex_tmp_*/

@@ -189,7 +189,7 @@ export default function SettingsPage() {
           </label>  
           <label className="field">  
             <span>启动模块</span>  
-            <input readOnly value="python -m uim_core.mcp_server" />  
+            <input readOnly value={mcpRuntimePaths?.runtimeKind === "sidecar" ? "uim-backend --mcp" : "python -m uim_core.mcp_server"} />
           </label>  
           <div className="runtime-list compact-list">  
             <span>  

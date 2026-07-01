@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "set \"NO_PROXY=127.0.0.1,localhost\" && set \"no_proxy=127.0.0.1,localhost\" && vite --configLoader runner",
     "build": "tsc && vite build --configLoader runner",
+    "build:backend-sidecar": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\build-backend-sidecar.ps1",
+    "build:tauri": "npm run build && npm run build:backend-sidecar",
     "preview": "vite preview --configLoader runner",
     "preview:static": ".venv\\Scripts\\python.exe -m http.server 5173 -d dist",
     "tauri": "set \"NO_PROXY=127.0.0.1,localhost\" && set \"no_proxy=127.0.0.1,localhost\" && set \"PATH=%USERPROFILE%\\.cargo\\bin;%CD%\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin;%PATH%\" && tauri",

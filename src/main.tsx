@@ -359,6 +359,8 @@ type McpRuntimePaths = {
   python: string;
   backend: string;
   available: boolean;
+  runtimeKind?: string;
+  mcpArgs?: string[];
 };
 
 type HealthResponse = {
@@ -2386,22 +2388,29 @@ function App() {
     return normalizeMcpPath(mcpRuntimePaths?.backend || pathJoinForMcp(absoluteMcpRoot(), "backend"));
   }
 
+  function pixelMcpArgs() {
+    return mcpRuntimePaths?.mcpArgs?.length ? mcpRuntimePaths.mcpArgs : ["-m", "uim_core.mcp_server"];
+  }
+
   function pixelMcpConfigJson() {
     const root = absoluteMcpRoot();
     if (!root) return "";
+    const env: Record<string, string> = {
+      UIM_CURRENT_PROJECT: normalizeMcpPath(projectRoot || ""),
+      NO_PROXY: "127.0.0.1,localhost",
+      no_proxy: "127.0.0.1,localhost"
+    };
+    if (mcpRuntimePaths?.runtimeKind !== "sidecar") {
+      env.PYTHONPATH = pixelMcpBackendPath();
+    }
     return JSON.stringify(
       {
         mcpServers: {
           "unreal-image-maker-pixel": {
             command: pixelMcpPythonPath(),
-            args: ["-m", "uim_core.mcp_server"],
+            args: pixelMcpArgs(),
             cwd: root,
-            env: {
-              UIM_CURRENT_PROJECT: normalizeMcpPath(projectRoot || ""),
-              PYTHONPATH: pixelMcpBackendPath(),
-              NO_PROXY: "127.0.0.1,localhost",
-              no_proxy: "127.0.0.1,localhost"
-            }
+            env
           }
         }
       },

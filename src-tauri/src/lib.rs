@@ -25,9 +25,25 @@ struct McpRuntimePaths {
     python: String,
     backend: String,
     available: bool,
+    #[serde(rename = "runtimeKind")]
+    runtime_kind: String,
+    #[serde(rename = "mcpArgs")]
+    mcp_args: Vec<String>,
 }
 
 const EXPECTED_API_CONTRACT_VERSION: &str = "uim-api-2026-06-29-ui-import-assets";
+const WINDOWS_TARGET_TRIPLE: &str = "x86_64-pc-windows-msvc";
+const SIDECAR_BASE_NAME: &str = "uim-backend";
+const SIDECAR_SUPPORT_DIR: &str = "uim-backend-support";
+
+struct BackendRuntime {
+    root: PathBuf,
+    command: PathBuf,
+    args: Vec<String>,
+    backend: Option<PathBuf>,
+    kind: &'static str,
+    mcp_args: Vec<String>,
+}
 
 fn backend_online() -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8765));
@@ -94,26 +110,84 @@ fn first_existing(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     paths.into_iter().find(|path| path.exists())
 }
 
-fn python_executable(project_root: Option<&Path>, resource_root: Option<&Path>) -> PathBuf {
-    let candidates = [
-        project_root.map(|root| root.join(".venv").join("Scripts").join("python.exe")),
-        resource_root.map(|root| root.join(".venv").join("Scripts").join("python.exe")),
-    ];
-    first_existing(candidates.into_iter().flatten()).unwrap_or_else(|| PathBuf::from("python"))
+fn source_backend_runtime(root: &Path) -> Option<BackendRuntime> {
+    let backend = root.join("backend");
+    let python = root.join(".venv").join("Scripts").join("python.exe");
+    if !backend.exists() || !python.exists() {
+        return None;
+    }
+    Some(BackendRuntime {
+        root: root.to_path_buf(),
+        command: python,
+        args: vec!["-m".to_string(), "uim_core.api".to_string()],
+        backend: Some(backend),
+        kind: "python-source",
+        mcp_args: vec!["-m".to_string(), "uim_core.mcp_server".to_string()],
+    })
 }
 
-fn backend_dir(project_root: Option<&Path>, resource_root: Option<&Path>) -> Option<PathBuf> {
-    let candidates = [
-        project_root.map(|root| root.join("backend")),
-        resource_root.map(|root| root.join("backend")),
-    ];
-    first_existing(candidates.into_iter().flatten())
+fn legacy_resource_backend_runtime(root: &Path) -> Option<BackendRuntime> {
+    let backend = root.join("backend");
+    let python = root.join(".venv").join("Scripts").join("python.exe");
+    if !backend.exists() || !python.exists() {
+        return None;
+    }
+    Some(BackendRuntime {
+        root: root.to_path_buf(),
+        command: python,
+        args: vec!["-m".to_string(), "uim_core.api".to_string()],
+        backend: Some(backend),
+        kind: "python-resource",
+        mcp_args: vec!["-m".to_string(), "uim_core.mcp_server".to_string()],
+    })
 }
 
-fn app_root(project_root: Option<&Path>, resource_root: Option<&Path>) -> PathBuf {
-    project_root
-        .or(resource_root)
-        .map(Path::to_path_buf)
+fn sidecar_executable(resource_root: &Path) -> Option<PathBuf> {
+    let exe_name = format!("{SIDECAR_BASE_NAME}-{WINDOWS_TARGET_TRIPLE}.exe");
+    first_existing([
+        resource_root.join("binaries").join(&exe_name),
+        resource_root.join(&exe_name),
+        resource_root.join("binaries").join(format!("{SIDECAR_BASE_NAME}.exe")),
+        resource_root.join(format!("{SIDECAR_BASE_NAME}.exe")),
+    ])
+}
+
+fn sidecar_backend_runtime(resource_root: &Path) -> Option<BackendRuntime> {
+    let executable = sidecar_executable(resource_root)?;
+    let root = executable.parent().unwrap_or(resource_root).to_path_buf();
+    let support = root.join(SIDECAR_SUPPORT_DIR);
+    Some(BackendRuntime {
+        root,
+        command: executable,
+        args: Vec::new(),
+        backend: Some(support),
+        kind: "sidecar",
+        mcp_args: vec!["--mcp".to_string()],
+    })
+}
+
+fn backend_runtime(app: &tauri::AppHandle) -> Option<BackendRuntime> {
+    if let Some(project_root) = project_root_from_current_dir() {
+        if let Some(runtime) = source_backend_runtime(&project_root) {
+            return Some(runtime);
+        }
+    }
+    if let Some(resource_root) = bundled_root(app) {
+        if let Some(runtime) = sidecar_backend_runtime(&resource_root) {
+            return Some(runtime);
+        }
+        if let Some(runtime) = legacy_resource_backend_runtime(&resource_root) {
+            return Some(runtime);
+        }
+    }
+    None
+}
+
+fn app_root(app: &tauri::AppHandle) -> PathBuf {
+    backend_runtime(app)
+        .map(|runtime| runtime.root)
+        .or_else(|| project_root_from_current_dir())
+        .or_else(|| bundled_root(app))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -135,26 +209,24 @@ fn start_backend(app: &tauri::AppHandle) -> Option<Child> {
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    let project_root = project_root_from_current_dir();
-    let resource_root = bundled_root(app);
-    let backend = backend_dir(project_root.as_deref(), resource_root.as_deref())?;
-    let python = python_executable(project_root.as_deref(), resource_root.as_deref());
-    let root = app_root(project_root.as_deref(), resource_root.as_deref());
+    let runtime = backend_runtime(app)?;
+    let root = runtime.root.clone();
     let (stdout_log, stderr_log) = backend_logs(&root);
     let stdout = File::create(stdout_log).ok()?;
     let stderr = File::create(stderr_log).ok()?;
 
-    let mut command = Command::new(python);
+    let mut command = Command::new(&runtime.command);
     command
-        .arg("-m")
-        .arg("uim_core.api")
-        .env("PYTHONPATH", &backend)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .current_dir(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    command.args(&runtime.args);
+    if let Some(backend) = runtime.backend.as_ref().filter(|path| path.exists()) {
+        command.env("PYTHONPATH", backend);
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -166,9 +238,7 @@ fn start_backend(app: &tauri::AppHandle) -> Option<Child> {
 }
 
 fn backend_status_for(app: &tauri::AppHandle) -> BackendStatus {
-    let project_root = project_root_from_current_dir();
-    let resource_root = bundled_root(app);
-    let root = app_root(project_root.as_deref(), resource_root.as_deref());
+    let root = app_root(app);
     let (stdout_log, stderr_log) = backend_logs(&root);
     BackendStatus {
         online: backend_online(),
@@ -178,21 +248,26 @@ fn backend_status_for(app: &tauri::AppHandle) -> BackendStatus {
 }
 
 fn mcp_runtime_paths_for(app: &tauri::AppHandle) -> McpRuntimePaths {
-    let project_root = project_root_from_current_dir();
-    let resource_root = bundled_root(app);
-    let backend = backend_dir(project_root.as_deref(), resource_root.as_deref());
-    let python = python_executable(project_root.as_deref(), resource_root.as_deref());
-    let root = app_root(project_root.as_deref(), resource_root.as_deref());
-    let available = backend.as_ref().is_some_and(|path| path.exists()) && python.exists();
-
+    if let Some(runtime) = backend_runtime(app) {
+        let backend = runtime.backend.clone().unwrap_or_else(|| runtime.root.join("backend"));
+        let available = runtime.command.exists() && (runtime.kind == "sidecar" || backend.exists());
+        return McpRuntimePaths {
+            root: runtime.root.to_string_lossy().to_string(),
+            python: runtime.command.to_string_lossy().to_string(),
+            backend: backend.to_string_lossy().to_string(),
+            available,
+            runtime_kind: runtime.kind.to_string(),
+            mcp_args: runtime.mcp_args,
+        };
+    }
+    let root = app_root(app);
     McpRuntimePaths {
         root: root.to_string_lossy().to_string(),
-        python: python.to_string_lossy().to_string(),
-        backend: backend
-            .unwrap_or_else(|| root.join("backend"))
-            .to_string_lossy()
-            .to_string(),
-        available,
+        python: PathBuf::from("python").to_string_lossy().to_string(),
+        backend: root.join("backend").to_string_lossy().to_string(),
+        available: false,
+        runtime_kind: "missing".to_string(),
+        mcp_args: vec!["-m".to_string(), "uim_core.mcp_server".to_string()],
     }
 }
 
